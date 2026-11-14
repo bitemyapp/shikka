@@ -55,8 +55,10 @@ Builds do not probe. They compare the size and modification time of the recorded
 tool files and, when one was replaced in place as rustup and system packages
 do, stop and ask for `generate`. This notices a replaced file, not a changed
 library behind an unchanged one. Nix store paths are immutable and never
-trigger it. To choose other tools or another action PATH, edit `project.json`
-and run `generate`.
+trigger it. A tool found in the Nix store is recorded at its store path under
+the name it was asked for by: rustc keeps its own default linker when the C
+compiler is called `cc`, as it is under Cargo, and drops it for `gcc`. To choose
+other tools or another action PATH, edit `project.json` and run `generate`.
 
 Global options precede the command. `--profile release`, `-p PACKAGE`, `--bin
 NAME`, `-j N` and `--buck-arg=FLAG` select and configure builds. `--features`,

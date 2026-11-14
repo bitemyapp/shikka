@@ -79,6 +79,22 @@ def requested_tools(args):
     return tools, None if defaults.get("BUILD_PATH") else os.environ.get("PATH", "")
 
 
+def pinned(tool, store=Path("/nix/store")):
+    """`tool` at its immutable path in the Nix store, under the name it was asked for by.
+
+    A profile's `cc` leads to the store's `cc`, not to the `gcc` that one
+    links to. rustc reads a linker's name: `cc` leaves rustc's own default
+    linker in place, as under Cargo, while `gcc` or `clang` turns it off. That
+    default is rust-lld on current x86-64 Linux toolchains, and without it a
+    large debug binary takes several times as long to link.
+    """
+    resolved = Path(tool).resolve()
+    if not resolved.is_relative_to(store):
+        return tool
+    named = resolved.parent / Path(tool).name
+    return str(named if named.exists() and named.resolve() == resolved else resolved)
+
+
 def workspace_directory(root, config):
     """The Cargo workspace: the project root, or a directory `init --root` put below it.
 
@@ -108,9 +124,7 @@ def toolchain(config, root, recorded=None):
         if Path(tools[key]).resolve().name == "rustup":
             tools[key] = str(sysroot / "bin" / key)
     for key in ["cc", "cxx", "ar"]:
-        resolved = Path(tools[key]).resolve()
-        if resolved.is_relative_to("/nix/store"):
-            tools[key] = str(resolved)
+        tools[key] = pinned(tools[key])
     tools["python"] = executable(sys.executable, "python3")
     version = output([tools["rustc"], "-vV"])
     tools["target"] = next(line.split(": ", 1)[1] for line in version.splitlines() if line.startswith("host: "))

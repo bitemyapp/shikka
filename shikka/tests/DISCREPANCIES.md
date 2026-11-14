@@ -33,7 +33,7 @@ record commands, duration and status. `SHIKKA_TEST_LIGHT=1` uses the reviewed
 | Path dependency outside the Cargo workspace; refused `init` leaves nothing and names a root | qualify.py | executed | executed |
 | Dylib built as a dependency and proc macro link std dynamically | stdout comparison | differential | light fixture |
 | Build script: compiled-in manifest directory; workspace lockfile and local dependency source | fixture build scripts | executed | executed |
-| Cargo's `prefer-dynamic` rule; package settings; workspace layout for a build script; Cargo and rustup run in the workspace | test_frontend.py | executed | executed |
+| Cargo's `prefer-dynamic` rule; package settings; workspace layout for a build script; Cargo and rustup run in the workspace; a Nix-store tool keeps its name, and rustc its default linker | test_frontend.py | executed | executed |
 | Service ownership, concurrent startup, mTLS, active-build stop guard, restart | test_service.py | real NativeLink | real NativeLink |
 
 These are finite regression checks, not a percentage score against all Cargo

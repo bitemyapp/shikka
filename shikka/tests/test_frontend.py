@@ -115,6 +115,22 @@ class Toolchain(unittest.TestCase):
         tools = project.toolchain({"tools": requested, "build_path": build_path}, self.root)
         self.assertEqual((tools["rustc"], tools["BUILD_PATH"]), (self.args.rustc, "/packaged/bin"))
 
+    def test_a_store_tool_keeps_the_name_it_was_asked_for_by(self):
+        # rustc keeps its default linker for `cc` and drops it for `gcc`.
+        store, profile = self.root / "store", self.root / "profile"
+        (store / "wrapper/bin").mkdir(parents=True)
+        profile.mkdir()
+        (store / "wrapper/bin/gcc").write_text("compiler")
+        (store / "wrapper/bin/cc").symlink_to("gcc")
+        (profile / "cc").symlink_to(store / "wrapper/bin/cc")
+        (profile / "system-cc").symlink_to(store / "wrapper/bin/gcc")
+        self.assertEqual(project.pinned(str(profile / "cc"), store), str(store / "wrapper/bin/cc"))
+        # No such name beside the file it leads to: the file itself.
+        self.assertEqual(project.pinned(str(profile / "system-cc"), store), str(store / "wrapper/bin/gcc"))
+        # Outside the store nothing is resolved; the path may be updated in place.
+        (self.root / "usr-cc").symlink_to(self.root / "cc")
+        self.assertEqual(project.pinned(str(self.root / "usr-cc"), store), str(self.root / "usr-cc"))
+
     def test_rustup_and_cargo_are_consulted_where_the_workspace_is(self):
         # With `init --root`, the workspace is below the project root. rustup
         # reads rust-toolchain.toml, and Cargo its configuration, from there up.
