@@ -97,5 +97,3 @@ def configure_content_store(root, args):
         print("Buck local content store disabled: this output/cache filesystem pair does not support reflinks; use --local-content-store=off to select this explicitly.", file=sys.stderr)
         return
     os.environ.update(zip(names, [str(directory), *(str(limit) for limit in limits)]))
-
-

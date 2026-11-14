@@ -1,0 +1,37 @@
+[2026-11-13T22:34:23.680-06:00] buck2 daemon constraint mismatch: Startup config mismatch; killing daemon...
+[2026-11-13T22:34:23.807-06:00] Starting new buck2 daemon...
+[2026-11-13T22:34:23.932-06:00] Connected to new buck2 daemon.
+[2026-11-13T22:34:23.935-06:00] Build ID: 5eeb82d0-c026-4cf6-9037-a8927dedfbd9
+[2026-11-13T22:34:24.119-06:00] RE Session: GRPC-SESSION-ID
+[2026-11-13T22:34:25.069-06:00] Cache hits: 0%
+[2026-11-13T22:34:25.069-06:00] Commands: 2 (cached: 0, remote: 0, local: 2)
+[2026-11-13T22:34:25.069-06:00] Network: up 3.2MiB  down 13KiB  session GRPC-SESSION-ID
+BUILD SUCCEEDED - starting your binary
+42
+[2026-11-13T22:34:25.283-06:00] Build ID: 219fb478-00fa-4696-a2cc-25af567d1941
+[2026-11-13T22:34:25.366-06:00] RE Session: GRPC-SESSION-ID
+[2026-11-13T22:34:26.824-06:00] ✓ Pass: root//.shikka/graph/test:e4efd2b7d533152699ad (0.3s)
+[2026-11-13T22:34:26.824-06:00] ---- STDOUT ----
+[2026-11-13T22:34:26.824-06:00]
+[2026-11-13T22:34:26.824-06:00] running 1 test
+[2026-11-13T22:34:26.824-06:00] test answer ... ok
+[2026-11-13T22:34:26.824-06:00]
+[2026-11-13T22:34:26.824-06:00] test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[2026-11-13T22:34:26.824-06:00]
+[2026-11-13T22:34:26.824-06:00]
+[2026-11-13T22:34:26.824-06:00] ---- STDERR ----
+[2026-11-13T22:34:26.824-06:00]
+[2026-11-13T22:34:27.010-06:00] ✓ Pass: root//.shikka/graph/test:a51e69328a856bc58c3a (0.1s)
+[2026-11-13T22:34:27.010-06:00] ---- STDOUT ----
+[2026-11-13T22:34:27.010-06:00]
+[2026-11-13T22:34:27.010-06:00] running 0 tests
+[2026-11-13T22:34:27.010-06:00]
+[2026-11-13T22:34:27.010-06:00] test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[2026-11-13T22:34:27.010-06:00]
+[2026-11-13T22:34:27.010-06:00]
+[2026-11-13T22:34:27.010-06:00] ---- STDERR ----
+[2026-11-13T22:34:27.010-06:00]
+[2026-11-13T22:34:27.013-06:00] Cache hits: 0%
+[2026-11-13T22:34:27.013-06:00] Commands: 3 (cached: 0, remote: 0, local: 3)
+[2026-11-13T22:34:27.013-06:00] Network: up 7.5MiB  down 17KiB  session GRPC-SESSION-ID
+Tests finished: [mPass 2[m. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. Infra Failure 0. Build failure 0

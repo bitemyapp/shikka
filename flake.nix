@@ -27,7 +27,12 @@
             pyproject = true;
             src = pkgs.lib.fileset.toSource {
               root = ./shikka;
-              fileset = pkgs.lib.fileset.unions [ ./shikka/pyproject.toml ./shikka/src ./shikka/LICENSE ];
+              fileset = pkgs.lib.fileset.unions [
+                ./shikka/pyproject.toml ./shikka/LICENSE
+                (pkgs.lib.fileset.fileFilter (file:
+                  file.hasExt "py" || file.hasExt "bzl" ||
+                  builtins.elem file.name [ ".buckconfig" "BUCK" "CARGO-LICENSE-MIT" ]) ./shikka/src)
+              ];
             };
             build-system = [ pkgs.python3Packages.setuptools ];
             makeWrapperArgs = [
