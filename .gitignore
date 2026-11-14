@@ -9,3 +9,10 @@ buck-out
 /examples/with_prelude/third-party/ocaml/opam
 /examples/with_prelude/third-party/haskell/ghc
 /examples/with_prelude/third-party/ocaml/standard_library
+
+# Standalone frontend development
+__pycache__/
+*.egg-info/
+/shikka/build/
+/shikka/dist/
+/result

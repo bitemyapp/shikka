@@ -1,0 +1,110 @@
+{
+  "light": true,
+  "reference": "42:hello\n",
+  "observations": [
+    {
+      "command": [
+        "cargo",
+        "generate-lockfile",
+        "--offline"
+      ],
+      "seconds": 0.28414545813575387,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "--offline",
+        "init"
+      ],
+      "seconds": 1.284535416867584,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "--bin",
+        "shikka-fixture",
+        "run"
+      ],
+      "seconds": 2.73181508295238,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "test"
+      ],
+      "seconds": 3.958567415829748,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "check"
+      ],
+      "seconds": 0.21535420790314674,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "build"
+      ],
+      "seconds": 0.6854773326776922,
+      "returncode": 3
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "--bin",
+        "shikka-fixture",
+        "run"
+      ],
+      "seconds": 1.1445299996994436,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "test"
+      ],
+      "seconds": 1.5004335828125477,
+      "returncode": 32
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "test"
+      ],
+      "seconds": 1.4747909167781472,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.15/bin/python3.15",
+        "-m",
+        "shikka",
+        "build"
+      ],
+      "seconds": 0.21272900002077222,
+      "returncode": 1
+    }
+  ]
+}
