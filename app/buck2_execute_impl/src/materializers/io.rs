@@ -162,10 +162,17 @@ where
             }
             Ok(())
         }
-        DirectoryEntry::Leaf(ActionDirectoryMember::File(_)) => {
+        DirectoryEntry::Leaf(ActionDirectoryMember::File(_metadata)) => {
             if let Some(src) = file_src(dest) {
-                fs_util::copy(src, &dest)
-                    .categorize_tagged(ErrorTag::MaterializeCopyMissingFile)?;
+                #[cfg(target_os = "macos")]
+                let cloned = super::local_content_store::local_cas_writes()
+                    && super::apfs::copy_owned(src.as_path(), dest.as_path(), _metadata)?;
+                #[cfg(not(target_os = "macos"))]
+                let cloned = false;
+                if !cloned {
+                    fs_util::copy(src, &dest)
+                        .categorize_tagged(ErrorTag::MaterializeCopyMissingFile)?;
+                }
                 if let Some(executable_bit_override) = executable_bit_override {
                     fs_util::set_executable(&dest, executable_bit_override)
                         .categorize_internal()?;

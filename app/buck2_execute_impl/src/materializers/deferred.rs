@@ -435,6 +435,24 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         _lease: &WriteLease,
         artifacts: Vec<DeclareArtifactPayload>,
     ) -> buck2_error::Result<()> {
+        // On the CAS host with cache writes, the CAS keeps produced outputs.
+        let artifacts = if crate::materializers::local_content_store::ingests_outputs() {
+            let fs = self.io.fs().clone();
+            let digest_config = self.io.digest_config();
+            tokio::task::spawn_blocking(move || {
+                for artifact in &artifacts {
+                    crate::materializers::local_content_store::artifact(
+                        &fs.resolve(&artifact.path),
+                        artifact.artifact.entry(),
+                        digest_config,
+                    )?;
+                }
+                buck2_error::Ok(artifacts)
+            })
+            .await??
+        } else {
+            artifacts
+        };
         let cmd =
             MaterializerCommand::DeclareExisting(artifacts, current_span(), get_dispatcher_opt());
         self.command_sender.send(cmd)?;
@@ -670,6 +688,14 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
             }],
         )
         .await?;
+        if crate::materializers::local_content_store::local_cas_writes() {
+            // The cache uploader lists the copy at `dest`; the placeholder keeps the same
+            // bytes, so list it too, or it alone keeps the extents the action wrote.
+            crate::materializers::local_content_store::note_in_local_cas(
+                &self.io.fs().resolve(&src),
+                value.entry(),
+            )?;
+        }
         let materializer: &dyn Materializer = self;
         materializer
             .declare_copy(
