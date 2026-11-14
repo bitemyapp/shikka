@@ -32,6 +32,18 @@ Buck2 fork and native Rust/C toolchain. `nix build .#buck2` builds just the engi
 Outputs are defined for x86_64 Linux and Apple/Intel macOS; the extracted Nix
 package has been exercised on x86_64 Linux, not Nix-on-Darwin.
 
+The Nix package's toolchain is a default. It has a compiler and a C toolchain
+and no libraries, which is enough for crates that need none. A project whose
+build scripts find C libraries with pkg-config, generate bindings or run other
+tools sets `SHIKKA_TOOLCHAIN` to a JSON file of its own before `init`.
+Lower-case keys name tools: `rustc`, `cargo`, `cc`, `cxx`, `ar`, and optionally
+`mold`, which then links the dev profile. Upper-case keys become the
+environment of every compilation and build script, such as `PKG_CONFIG_PATH`
+and `LIBCLANG_PATH`. `BUILD_PATH` is their PATH, the `-L` directories in
+`NIX_LDFLAGS` are given to rustc, and `LIBRARY_PATH` is where build scripts
+and tests find shared libraries. `SHIKKA_DEFAULT_BUCK2` and
+`SHIKKA_DEFAULT_CARGO` choose another engine or Cargo the same way.
+
 Without Nix, install `shikka/` into a Python virtual environment:
 
 ```sh

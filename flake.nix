@@ -35,10 +35,12 @@
               ];
             };
             build-system = [ pkgs.python3Packages.setuptools ];
+            # Defaults, not settings: a project whose crates need C libraries
+            # or other tools names its own toolchain in SHIKKA_TOOLCHAIN.
             makeWrapperArgs = [
-              "--set" "SHIKKA_DEFAULT_BUCK2" "${buck2}/bin/buck2"
-              "--set" "SHIKKA_TOOLCHAIN" "${tools}"
-              "--set" "SHIKKA_DEFAULT_CARGO" "${pkgs.cargo}/bin/cargo"
+              "--set-default" "SHIKKA_DEFAULT_BUCK2" "${buck2}/bin/buck2"
+              "--set-default" "SHIKKA_TOOLCHAIN" "${tools}"
+              "--set-default" "SHIKKA_DEFAULT_CARGO" "${pkgs.cargo}/bin/cargo"
               "--prefix" "PATH" ":" "${pkgs.lib.makeBinPath [ pkgs.openssl ]}"
             ];
             pythonImportsCheck = [ "shikka.cli" "shikka.generate" "shikka.service" ];
