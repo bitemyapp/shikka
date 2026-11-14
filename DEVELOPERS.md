@@ -67,6 +67,37 @@ Cargo's test profile. `shikka targets` prints labels, `shikka outputs` prints
 output locations, and `shikka check` verifies the graph and generated file
 fingerprints.
 
+Buck builds one tree, so the project root must contain every local package.
+By default it is the Cargo workspace. When path dependencies lie outside the
+workspace, `init` stops before writing anything and names a directory that
+holds them; pass it as `--root DIR`. Cargo and rustup still run in the
+workspace, where they find its `.cargo/config.toml` and `rust-toolchain.toml`,
+and commands work from anywhere below the root. An `init` that fails can be
+run again.
+
+Two things Cargo's graph cannot say are read from a local package's manifest:
+
+```toml
+[package.metadata.shikka]
+rustflags = ["-C", "prefer-dynamic"]
+build-script-reads-workspace = true
+```
+
+`rustflags` are extra rustc arguments for that package's targets: what a
+`RUSTC_WRAPPER` matching one crate does under Cargo, which Shikka refuses. The
+package's build script sees them in `CARGO_ENCODED_RUSTFLAGS`; its compilation
+does not get them. Shikka follows Cargo's own rule for `-C prefer-dynamic`:
+proc macros and dylibs built only as dependencies get it. The graph is
+`cargo build --workspace`, in which no member is only a dependency, so a
+member's dylib that other crates link has to ask for it here, as it would need
+a wrapper under Cargo.
+
+A build script's inputs are its own package. `build-script-reads-workspace`
+adds the workspace's `Cargo.toml` and `Cargo.lock` and the sources of the
+package's local dependencies, laid out around the package as they are in the
+checkout, and reruns the script when any of them changes. An unknown key is an
+error, and a registry package's settings are ignored.
+
 `shikka run` starts the program as Cargo does: in the caller's directory, with
 the caller's environment plus the package's `CARGO_*` variables and library
 path. `shikka test` gives tests the caller's environment too, apart from a
@@ -78,8 +109,9 @@ get only the toolchain's declared environment.
 
 Project state lives in `.shikka/`, and generated BUCK/.buckconfig files are
 excluded through Git's local info/exclude. The importer fails if it would replace
-an existing unowned file. Cargo workspaces stay separate. Nothing is added to
-another project's Cargo manifest.
+an existing unowned file. Cargo workspaces stay separate. Shikka writes nothing
+to a project's Cargo manifests; it reads `[package.metadata.shikka]` where the
+project has added it.
 
 ## Cache and filesystem contract
 
@@ -106,6 +138,9 @@ to read-only. Credentials are never committed or placed in CLI arguments.
 
 Linux test-unit identities include their checkout root. Darwin scopes all actions
 to its root until embedded Rust paths have a portable relocation contract.
+A Linux build script is compiled with `CARGO_MANIFEST_DIR=.`: it runs in its
+package directory, where the `/proc/self/cwd` path other units get names
+nothing, and `.` is the same in every checkout.
 Btrfs/XFS storage code is imported without behavioral changes. The APFS follow-up
 detaches rustc's hardlinked incremental aliases before capturing publication
 guards; this avoids false concurrent-mutation failures from sibling ctime updates.

@@ -79,6 +79,15 @@ def requested_tools(args):
     return tools, None if defaults.get("BUILD_PATH") else os.environ.get("PATH", "")
 
 
+def workspace_directory(root, config):
+    """The Cargo workspace: the project root, or a directory `init --root` put below it.
+
+    Cargo and rustup read their configuration from the directory they run in
+    and its parents, so Cargo runs here, as it does for the project's developers.
+    """
+    return root / config.get("workspace", "")
+
+
 def toolchain(config, root, recorded=None):
     """Resolve and probe the project's recorded tool choices.
 
@@ -94,7 +103,7 @@ def toolchain(config, root, recorded=None):
         tools[key] = executable(requested.get(key) or defaults.get(key), default)
     # Resolve rustup's dispatchers while the caller's project/toolchain context
     # is available. Compiler actions deliberately have a private HOME.
-    sysroot = Path(subprocess.check_output([tools["rustc"], "--print", "sysroot"], cwd=root, text=True).strip())
+    sysroot = Path(subprocess.check_output([tools["rustc"], "--print", "sysroot"], cwd=workspace_directory(root, config), text=True).strip())
     for key in ["rustc", "cargo"]:
         if Path(tools[key]).resolve().name == "rustup":
             tools[key] = str(sysroot / "bin" / key)
@@ -157,14 +166,14 @@ def find_root():
     raise ValueError("No Shikka project here; run shikka init --manifest-path PATH/Cargo.toml.")
 
 
-def cargo(root, tools, arguments, *, vendored=True, capture=True):
+def cargo(root, config, tools, arguments, *, vendored=True, capture=True):
     env = dict(os.environ, RUSTC=tools["rustc"], RUSTC_BOOTSTRAP="1", CARGO_TARGET_DIR=str(root / ".shikka/cargo-target"))
     for name in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"]:
         env.pop(name, None)
     command = [tools["cargo"]]
     if vendored:
         command += ["--config", str(root / ".shikka/vendor.toml")]
-    return subprocess.run(command + arguments, cwd=root, env=env, check=True, text=True,
+    return subprocess.run(command + arguments, cwd=workspace_directory(root, config), env=env, check=True, text=True,
                           stdout=subprocess.PIPE if capture else None).stdout
 
 
@@ -181,19 +190,20 @@ def app_inputs():
     return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files if p.is_file()}
 
 
-def cargo_configs(root):
-    paths = {directory / ".cargo" / name for directory in [root, *root.parents] for name in ["config", "config.toml"]}
+def cargo_configs(directory):
+    """The configuration files Cargo reads when it runs in `directory`."""
+    paths = {parent / ".cargo" / name for parent in [directory, *directory.parents] for name in ["config", "config.toml"]}
     home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     paths.update(home / name for name in ["config", "config.toml"])
     return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(paths) if path.is_file()}
 
 
-def validate_cargo_config(root, tools):
+def validate_cargo_config(directory, tools):
     for name in os.environ:
         if name in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTFLAGS", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"} or (name.startswith("CARGO_TARGET_") and name.endswith(("_RUSTFLAGS", "_LINKER", "_RUNNER"))):
             if os.environ[name]:
                 raise ValueError("Unsupported implicit Cargo setting: " + name)
-    for name in cargo_configs(root):
+    for name in cargo_configs(directory):
         data = tomllib.loads(Path(name).read_text())
         unsupported = set(data.get("build", {})) & {"target", "rustflags", "rustc", "rustc-wrapper", "rustc-workspace-wrapper", "rustdocflags"}
         if unsupported or data.get("env") or data.get("unstable"):

@@ -1,0 +1,11 @@
+[package]
+name = "helper"
+version = "0.1.0"
+edition = "2024"
+[features]
+answer = []
+[dependencies]
+outside = { path = "../../outside" }
+# build.rs reads the workspace's lockfile and a local dependency's source.
+[package.metadata.shikka]
+build-script-reads-workspace = true

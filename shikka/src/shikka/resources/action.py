@@ -120,7 +120,9 @@ def profile_flags(unit):
         flags += ["-C", "linker-plugin-lto"]
     if profile.get("rpath"):
         flags += ["-C", "rpath"]
-    return flags
+    if unit.get("prefer_dynamic"):
+        flags += ["-C", "prefer-dynamic"]
+    return flags + unit.get("rustflags", [])
 
 
 def cfg_environment(tools, flags):
@@ -169,24 +171,33 @@ def script_instructions(stdout):
     return result
 
 
+def assemble_workspace(workspace, sources):
+    """Lay several source trees out at their paths below the project root.
+
+    A build script that reads its workspace needs the lockfile and its local
+    dependencies beside its own package. Directories are created and files are
+    linked, as in the trees Buck stages, so `..` from any of them stays inside
+    the assembled workspace rather than following a link out of it.
+    """
+    for relative, source in sorted(sources.items()):
+        for directory, names, files in os.walk(source):
+            target = workspace / relative / os.path.relpath(directory, source)
+            target.mkdir(parents=True, exist_ok=True)
+            # os.walk lists a link to a directory among the directories and
+            # does not enter it.
+            for name in files + [name for name in names if os.path.islink(os.path.join(directory, name))]:
+                (target / name).symlink_to(os.path.relpath(os.path.join(directory, name), target))
+
+
 def run_script(payload, output, env, tools, root):
     unit = payload["unit"]
     manifest = Path(payload["source"]).absolute()
     extras = payload["extra_sources"]
     if extras:
         workspace = output / "workspace"
-        paths = dict(extras)
-        paths[unit["package"]["path"]] = payload["source"]
-        for relative, source in sorted(paths.items()):
-            link = workspace / relative
-            link.parent.mkdir(parents=True, exist_ok=True)
-            source = Path(source).absolute()
-            if any(other.startswith(relative + "/") for other in paths):
-                link.mkdir(exist_ok=True)
-                for child in source.iterdir():
-                    (link / child.name).symlink_to(os.path.relpath(child, link), target_is_directory=child.is_dir())
-            else:
-                link.symlink_to(os.path.relpath(source, link.parent), target_is_directory=True)
+        sources = dict(extras)
+        sources[unit["package"]["path"]] = payload["source"]
+        assemble_workspace(workspace, {relative: Path(source).absolute() for relative, source in sources.items()})
         manifest = workspace / unit["package"]["path"]
     env.update(package_environment(unit, manifest))
     out_dir = output / "out"
@@ -341,6 +352,11 @@ def compile_unit(payload, output, env, tools, root, dep_file, incremental_direct
         args = [execution_root.sub(r"\1/proc/self/cwd", value) for value in args]
         if unit["mode"] != "test":
             env = {key: execution_root.sub(r"\1/proc/self/cwd", value) for key, value in env.items()}
+            if "custom-build" in target["kind"]:
+                # A build script runs in its package directory, not here, so a
+                # path below /proc/self/cwd compiled into it would name nothing.
+                # "." names that directory there, and in every checkout.
+                env.update(CARGO_MANIFEST_DIR=".", CARGO_MANIFEST_PATH="Cargo.toml")
     else:
         args += ["--remap-path-prefix", str(root) + "=."]
     subprocess.run(args, env=env, check=True)

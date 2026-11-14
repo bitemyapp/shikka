@@ -12,8 +12,11 @@ import time
 app = [sys.executable, "-m", "shikka"]
 fixture = Path(__file__).parent / "fixture"
 with tempfile.TemporaryDirectory(prefix="shikka-qualification-") as directory:
-    root = Path(directory) / "project"
-    shutil.copytree(fixture, root)
+    # The Cargo workspace has a path dependency beside it, so the project root
+    # is the directory above. Commands run in the workspace, as a developer's do.
+    project = Path(directory).resolve() / "project"
+    shutil.copytree(fixture, project)
+    root = project / "workspace"
     elsewhere = root / "elsewhere"
     elsewhere.mkdir()
     caller = dict(os.environ, FIXTURE_CALLER="visible")
@@ -40,7 +43,11 @@ with tempfile.TemporaryDirectory(prefix="shikka-qualification-") as directory:
     archiver.write_text('#!/bin/sh\nexec "' + (packaged.get("ar") or shutil.which("ar")) + '" "$@"\n')
     archiver.chmod(0o755)
     try:
-        run(app + ["--offline", "--ar", str(archiver), "init"])
+        # A root that cannot hold the path dependency is refused before
+        # anything is written, and the refusal names one that can.
+        run(app + ["--offline", "--ar", str(archiver), "init"], success=False, message="--root " + str(project))
+        assert not (root / ".shikka").exists() and not (root / ".buckconfig").exists()
+        run(app + ["--offline", "--ar", str(archiver), "--root", "..", "init"])
         assert run(build + ["--bin", "shikka-fixture", "run"]) == reference
         # Like Cargo, run starts the program where the caller is, with its environment.
         assert run(build + ["--bin", "shikka-fixture", "run"], cwd=elsewhere, env=probe) == probed
@@ -70,13 +77,14 @@ with tempfile.TemporaryDirectory(prefix="shikka-qualification-") as directory:
         run(app + ["--offline", "generate"])
         run(app + ["check"])
         assert run(build + ["--bin", "shikka-fixture", "run"]) == reference
-        # A new Cargo configuration must invalidate an already generated graph.
+        # A new Cargo configuration must invalidate an already generated graph,
+        # also where Cargo reads it and the project root is not: the workspace.
         (root / ".cargo").mkdir()
         (root / ".cargo/config.toml").write_text('[build]\nrustflags = ["--cfg", "unsupported"]\n')
         run(build + ["build"], success=False)
         print(json.dumps({"light": light, "reference": reference, "observations": observations}, indent=2))
     finally:
-        config = root / ".shikka/project.json"
+        config = project / ".shikka/project.json"
         if config.exists():
             buck = json.loads(config.read_text())["buck2"]
-            subprocess.run([buck, "--isolation-dir", "shikka", "kill"], cwd=root, capture_output=True)
+            subprocess.run([buck, "--isolation-dir", "shikka", "kill"], cwd=project, capture_output=True)

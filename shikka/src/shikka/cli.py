@@ -14,7 +14,7 @@ import time
 from types import SimpleNamespace
 
 from . import __version__, generate, service, storage
-from .project import RESOURCES, MARKER, atomic_write, cargo, executable, find_root, fingerprint, owned_write, read, requested_tools, toolchain, write_json, validate_cargo_config
+from .project import RESOURCES, MARKER, atomic_write, cargo, executable, find_root, fingerprint, owned_write, read, requested_tools, toolchain, workspace_directory, write_json, validate_cargo_config
 
 BUILD = {"build", "test", "run", "outputs"}
 SELECT = BUILD | {"targets"}
@@ -29,6 +29,8 @@ ACCEPTS = {
     "cache_write": BUILD, "no_local_cas": BUILD, "local_content_store": BUILD, "jobs": BUILD, "buck_arg": BUILD,
     "profile": SELECT - {"test"}, "package": SELECT, "bin": SELECT, "all_units": SELECT,
     "targets": SELECT | {"cache"},
+    # Where the project is, not something project.json can change afterwards.
+    "root": {"init"},
 }
 
 
@@ -53,7 +55,12 @@ def initialize(args):
     manifest = Path(args.manifest_path or "Cargo.toml").resolve(strict=True)
     # Cargo identifies the workspace root, including when invoked at a member.
     initial_cargo = executable(args.cargo or os.environ.get("SHIKKA_DEFAULT_CARGO"), "cargo")
-    root = Path(json.loads(subprocess.check_output([initial_cargo, "locate-project", "--workspace", "--manifest-path", str(manifest), "--message-format", "json"], text=True))["root"]).parent.resolve()
+    workspace = Path(json.loads(subprocess.check_output([initial_cargo, "locate-project", "--workspace", "--manifest-path", str(manifest), "--message-format", "json"], text=True))["root"]).parent.resolve()
+    # Buck builds one tree. Path dependencies may live outside the Cargo
+    # workspace, so the project root can be a directory above it.
+    root = Path(args.root).resolve(strict=True) if args.root else workspace
+    if not workspace.is_relative_to(root):
+        raise ValueError("--root must contain the Cargo workspace " + str(workspace))
     if (root / ".shikka/project.json").exists():
         raise ValueError("Project is already initialized; use shikka generate, or edit .shikka/project.json.")
     if (root / ".buckconfig").exists() and not (root / ".buckconfig").read_text().startswith(MARKER):
@@ -63,17 +70,23 @@ def initialize(args):
             raise ValueError(variable + " is not supported implicitly; use an explicit toolchain configuration.")
     requested, build_path = requested_tools(args)
     buck2 = executable(args.buck2 or os.environ.get("SHIKKA_DEFAULT_BUCK2"), "buck2")
-    config = {"schema": 1, "manifest": manifest.relative_to(root).as_posix(), "buck2": buck2, "tools": requested, "build_path": build_path,
+    config = {"schema": 1, "manifest": manifest.relative_to(root).as_posix(), "workspace": generate.below(root, workspace), "buck2": buck2, "tools": requested, "build_path": build_path,
               "nativelink": args.nativelink or os.environ.get("SHIKKA_DEFAULT_NATIVELINK"), "cache": args.cache or "off",
               "state_dir": str(Path(args.state_dir).expanduser().resolve()) if args.state_dir else None, "cache_bytes": args.cache_bytes, "config_file": str(Path(args.config_file).expanduser().resolve()) if args.config_file else None,
               "features": args.features or "", "no_default_features": args.no_default_features,
               "profiles": ["dev", "release", "test"]}
     tools = toolchain(config, root)
-    validate_cargo_config(root, tools)
+    validate_cargo_config(workspace, tools)
+    # Ask Cargo where the local packages are before writing anything, so that
+    # a root that cannot hold them leaves no half-initialized project behind.
+    located = ["metadata", "--format-version", "1", "--locked", "--manifest-path", str(manifest)] + (["--offline"] if args.offline else [])
+    generate.require_inside(json.loads(cargo(root, config, tools, located, vendored=False)), root)
     directory = root / ".shikka"
     directory.mkdir(mode=0o700, exist_ok=True)
     write_json(directory / "toolchain.json", tools)
     write_json(directory / "project.json", config)
+    # Cargo's own target directory is in the workspace; Buck need not watch it.
+    target = (config["workspace"] + "/" if config["workspace"] else "") + "target"
     # Bundled prelude provides only the standard source/export providers. Rust
     # compilation is our Cargo unit rule; no second dependency resolver exists.
     owned_write(root, ".buckconfig", MARKER + "\n" + f"""[cells]
@@ -102,11 +115,17 @@ clean_stale_low_disk_threshold = 10
 clean_stale_low_disk_artifact_ttl_hours = 12
 defer_write_actions = true
 [project]
-ignore = .git target buck-out .shikka/cargo-target .shikka/test-tmp
+ignore = .git {target} buck-out .shikka/cargo-target .shikka/test-tmp
 """)
     (directory / "toolchains").mkdir(exist_ok=True)
     owned_write(root, ".shikka/toolchains/BUCK", MARKER + "\n")
-    refresh(root, config, tools, offline=args.offline)
+    try:
+        refresh(root, config, tools, offline=args.offline)
+    except BaseException:
+        # project.json is what marks a project initialized, and init refuses
+        # to replace it. A failed init must be one that can be run again.
+        (directory / "project.json").unlink(missing_ok=True)
+        raise
     print("Initialized " + str(root))
 
 
@@ -121,16 +140,16 @@ def regenerate(root, config, recorded, offline=False):
 
 
 def refresh(root, config, tools, offline=False):
-    validate_cargo_config(root, tools)
+    validate_cargo_config(workspace_directory(root, config), tools)
     rules = root / ".shikka/rules"
     rules.mkdir(exist_ok=True)
     for resource in RESOURCES.iterdir():
         if resource.is_file():
             atomic_write(rules / resource.name, resource.read_text(), 0o644)
-    command = ["vendor", "--locked", "--versioned-dirs", "--manifest-path", config["manifest"]]
+    command = ["vendor", "--locked", "--versioned-dirs", "--manifest-path", str(root / config["manifest"])]
     if offline: command.append("--offline")
     command.append(str(root / ".shikka/vendor"))
-    vendor_config = cargo(root, tools, command, vendored=False)
+    vendor_config = cargo(root, config, tools, command, vendored=False)
     atomic_write(root / ".shikka/vendor.toml", vendor_config)
     state = generate.generate(root, config, tools)
     # Keep generated files out of commits without changing the project's
@@ -195,7 +214,7 @@ def environment_snapshot(root, command):
 
 
 def invoke(root, config, tools, args, passthrough):
-    validate_cargo_config(root, tools)
+    validate_cargo_config(workspace_directory(root, config), tools)
     state = generate.current(root)
     targets = select(state, args)
     if args.command == "targets":
@@ -279,6 +298,7 @@ def parser():
     p = argparse.ArgumentParser(description="Cargo resolves; Shikka builds, caches and shares artifacts.")
     p.add_argument("--version", action="version", version="shikka " + __version__)
     p.add_argument("--manifest-path", help="init only (default Cargo.toml)")
+    p.add_argument("--root", help="init only: the project root, when path dependencies lie outside the Cargo workspace (default: the workspace)")
     for key in ["buck2", "nativelink", "rustc", "cargo", "cc", "cxx", "ar"]: p.add_argument("--" + key)
     p.add_argument("--profile", choices=["dev", "release"], help="default dev; test always uses Cargo's test profile")
     p.add_argument("-p", "--package", action="append", default=[])

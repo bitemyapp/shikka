@@ -1,5 +1,5 @@
 #[cfg(feature = "answer")]
-pub fn answer() -> u32 { 40 }
+pub fn answer() -> u32 { 39 + outside::unit() }
 #[cfg(not(feature = "answer"))]
 pub fn answer() -> u32 { 0 }
 #[test]
