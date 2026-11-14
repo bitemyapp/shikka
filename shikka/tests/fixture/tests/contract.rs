@@ -7,3 +7,9 @@ fn cargo_paths_survive_child_chdir() {
     assert_eq!(output.stdout, b"42:hello\n");
     assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml").exists());
 }
+
+// qualify.py sets this for Cargo and for Shikka alike.
+#[test]
+fn caller_environment_reaches_tests() {
+    assert_eq!(std::env::var("FIXTURE_CALLER").as_deref(), Ok("visible"));
+}

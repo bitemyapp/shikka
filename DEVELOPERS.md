@@ -1,7 +1,13 @@
 # Developing Shikka
 
-Work on a `codex/` topic branch from main and submit reviewed work before
-squash-merging. Release publication is inhibited. Upstream workflows are kept
+Work on a `codex/` topic branch from main and submit it for review. Merge a
+branch that imports or changes the engine with a merge commit, never a squash:
+`shikka/engine-origin.json` and the qualification reports cite individual
+commits, and the provenance of the engine is checkable only while the import
+commit, whose tree is upstream plus the recorded patches, stays in history.
+Frontend-only branches may be squash-merged.
+
+Release publication is inhibited. Upstream workflows are kept
 as reference in `.github/upstream-workflows`, outside GitHub's workflow discovery
 path; repository Actions are also disabled. Do not enable releases implicitly.
 
@@ -38,16 +44,37 @@ python3 -m venv .venv
 
 The CLI has no Python runtime dependencies. Init/generate uses Cargo metadata,
 `cargo vendor --locked`, and the unstable Cargo unit-graph interface with the
-chosen rustc. Ordinary builds/tests/runs do not invoke Cargo or Nix. Toolchain
-executables must remain installed; regenerate/reinitialize their configuration
-when changing compiler versions. Nix store paths provide immutable toolchains;
-mutable user toolchain installations require operator-managed regeneration.
+chosen rustc. Ordinary builds/tests/runs do not invoke Cargo or Nix.
+
+`init` records the chosen tools in `.shikka/project.json`, as absolute paths or
+as a deferral to the packaged toolchain, with the PATH that actions run with.
+`init` and every `generate` resolve those choices and probe their versions into
+`.shikka/toolchain.json`, which is part of every action's identity. A rustup
+proxy is followed to the toolchain it selects for the project at that moment.
+Builds do not probe. They compare the size and modification time of the recorded
+tool files and, when one was replaced in place as rustup and system packages
+do, stop and ask for `generate`. This notices a replaced file, not a changed
+library behind an unchanged one. Nix store paths are immutable and never
+trigger it. To choose other tools or another action PATH, edit `project.json`
+and run `generate`.
 
 Global options precede the command. `--profile release`, `-p PACKAGE`, `--bin
-NAME`, `--features FEATURES` (at init), `--no-default-features`, `-j N`, and
-`--buck-arg=FLAG` provide the supported selection/configuration interface.
-`shikka targets` prints labels, `shikka outputs` prints output locations, and
-`shikka check` verifies the graph and generated file fingerprints.
+NAME`, `-j N` and `--buck-arg=FLAG` select and configure builds. `--features`,
+`--no-default-features`, `--manifest-path` and the tool paths are recorded by
+`init`; change them in `project.json` and run `generate`. An option given to a
+command that does not read it is an error, and `shikka test` always uses
+Cargo's test profile. `shikka targets` prints labels, `shikka outputs` prints
+output locations, and `shikka check` verifies the graph and generated file
+fingerprints.
+
+`shikka run` starts the program as Cargo does: in the caller's directory, with
+the caller's environment plus the package's `CARGO_*` variables and library
+path. `shikka test` gives tests the caller's environment too, apart from a
+private HOME, TMPDIR, XDG_RUNTIME_DIR and CARGO_TARGET_DIR and unreachable
+D-Bus addresses. Buck2's daemon starts tests and does not have that
+environment, so the CLI passes it in a mode-0600 file under `buck-out/shikka`
+and removes the file when the command ends. Tests started by plain `buck2 test`
+get only the toolchain's declared environment.
 
 Project state lives in `.shikka/`, and generated BUCK/.buckconfig files are
 excluded through Git's local info/exclude. The importer fails if it would replace
@@ -97,8 +124,9 @@ python3 shikka/tests/qualify.py > qualification.json
 
 The differential fixture uses the installed Cargo/Rust pair as its reference;
 ensure it is the same toolchain passed to init. On the laptop use
-`SHIKKA_TEST_LIGHT=1` and the cached engine, with two build threads. It avoids
-compiling the reference twice. Test logs distinguish engine checks, frontend
+`SHIKKA_TEST_LIGHT=1` and the cached engine. The harness then passes `-j 2` and
+avoids compiling the reference twice; Shikka itself leaves Buck2's thread count
+alone unless `-j` is given. `test_frontend.py` needs no engine. Test logs distinguish engine checks, frontend
 checks, real external-repository tests, and storage evidence. No ISO or host disk
 mutation is involved. Do not turn these checks into claims of full Cargo or XFS
 qualification when that platform was not exercised.

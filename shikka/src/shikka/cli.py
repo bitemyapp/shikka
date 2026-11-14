@@ -9,15 +9,48 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 
 from . import __version__, generate, service, storage
-from .project import RESOURCES, MARKER, atomic_write, cargo, executable, find_root, fingerprint, owned_write, read, toolchain, write_json, validate_cargo_config
+from .project import RESOURCES, MARKER, atomic_write, cargo, executable, find_root, fingerprint, owned_write, read, requested_tools, toolchain, write_json, validate_cargo_config
+
+BUILD = {"build", "test", "run", "outputs"}
+SELECT = BUILD | {"targets"}
+# What `init` writes to project.json; later commands read it from there.
+RECORDED = {"manifest_path", "rustc", "cargo", "cc", "cxx", "ar", "buck2", "features", "no_default_features"}
+# The commands that read each option. Every parser option has an entry.
+ACCEPTS = {
+    **{name: {"init"} for name in RECORDED},
+    "offline": {"init", "generate"},
+    "cache": {"init"} | BUILD, "config_file": {"init"} | BUILD,
+    "nativelink": {"init", "cache"} | BUILD, "state_dir": {"init", "cache"} | BUILD, "cache_bytes": {"init", "cache"} | BUILD,
+    "cache_write": BUILD, "no_local_cas": BUILD, "local_content_store": BUILD, "jobs": BUILD, "buck_arg": BUILD,
+    "profile": SELECT - {"test"}, "package": SELECT, "bin": SELECT, "all_units": SELECT,
+    "targets": SELECT | {"cache"},
+}
+
+
+def reject_unused(args):
+    """An option the command does not read is an error, not a silent no-op."""
+    for name, commands in ACCEPTS.items():
+        value = getattr(args, name)
+        absent = value is None or value == [] or (value is False and name != "cache_write")
+        if absent or args.command in commands:
+            continue
+        if name == "targets":
+            raise ValueError(f"shikka {args.command} takes no targets: {' '.join(value)}")
+        option = "--" + name.replace("_", "-")
+        if name == "profile" and args.command == "test":
+            raise ValueError("shikka test always uses Cargo's test profile; --profile does not apply.")
+        if name in RECORDED:
+            raise ValueError(f"{option} is recorded by shikka init and does not apply to shikka {args.command}; to change it, edit .shikka/project.json and run shikka generate.")
+        raise ValueError(f"{option} does not apply to shikka {args.command}.")
 
 
 def initialize(args):
-    manifest = Path(args.manifest_path).resolve(strict=True)
+    manifest = Path(args.manifest_path or "Cargo.toml").resolve(strict=True)
     # Cargo identifies the workspace root, including when invoked at a member.
     initial_cargo = executable(args.cargo or os.environ.get("SHIKKA_DEFAULT_CARGO"), "cargo")
     root = Path(json.loads(subprocess.check_output([initial_cargo, "locate-project", "--workspace", "--manifest-path", str(manifest), "--message-format", "json"], text=True))["root"]).parent.resolve()
@@ -28,14 +61,15 @@ def initialize(args):
     for variable in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"]:
         if os.environ.get(variable):
             raise ValueError(variable + " is not supported implicitly; use an explicit toolchain configuration.")
-    tools = toolchain(args, root)
-    validate_cargo_config(root, tools)
+    requested, build_path = requested_tools(args)
     buck2 = executable(args.buck2 or os.environ.get("SHIKKA_DEFAULT_BUCK2"), "buck2")
-    config = {"schema": 1, "manifest": manifest.relative_to(root).as_posix(), "buck2": buck2,
+    config = {"schema": 1, "manifest": manifest.relative_to(root).as_posix(), "buck2": buck2, "tools": requested, "build_path": build_path,
               "nativelink": args.nativelink or os.environ.get("SHIKKA_DEFAULT_NATIVELINK"), "cache": args.cache or "off",
               "state_dir": str(Path(args.state_dir).expanduser().resolve()) if args.state_dir else None, "cache_bytes": args.cache_bytes, "config_file": str(Path(args.config_file).expanduser().resolve()) if args.config_file else None,
-              "features": args.features, "no_default_features": args.no_default_features,
+              "features": args.features or "", "no_default_features": args.no_default_features,
               "profiles": ["dev", "release", "test"]}
+    tools = toolchain(config, root)
+    validate_cargo_config(root, tools)
     directory = root / ".shikka"
     directory.mkdir(mode=0o700, exist_ok=True)
     write_json(directory / "toolchain.json", tools)
@@ -76,6 +110,16 @@ ignore = .git target buck-out .shikka/cargo-target .shikka/test-tmp
     print("Initialized " + str(root))
 
 
+def regenerate(root, config, recorded, offline=False):
+    """Probe the toolchain again, then import Cargo's graph with it."""
+    tools = toolchain(config, root, recorded)
+    changed = sorted(key for key in recorded.keys() | tools.keys() if recorded.get(key) != tools.get(key))
+    if changed:
+        write_json(root / ".shikka/toolchain.json", tools)
+        print("Toolchain changed (" + ", ".join(changed) + "); its actions will rebuild.")
+    return refresh(root, config, tools, offline=offline)
+
+
 def refresh(root, config, tools, offline=False):
     validate_cargo_config(root, tools)
     rules = root / ".shikka/rules"
@@ -104,7 +148,7 @@ def refresh(root, config, tools, offline=False):
 
 
 def select(state, args):
-    profile = "test" if args.command == "test" else args.profile
+    profile = "test" if args.command == "test" else args.profile or "dev"
     targets = state["units" if args.all_units else "targets"][profile]
     if args.package: targets = [t for t in targets if t["package"] in args.package]
     if args.bin: targets = [t for t in targets if "bin" in t["kind"] and t["target"] == args.bin]
@@ -116,6 +160,38 @@ def select(state, args):
     if args.command == "run" and (len(targets) != 1 or "bin" not in targets[0]["kind"]):
         raise ValueError("Select one executable with --bin NAME or an explicit target")
     return targets
+
+
+def buck_command(config, args, targets, private, passthrough, snapshot=None):
+    operation = "build" if args.command == "outputs" else args.command
+    command = [config["buck2"], "--isolation-dir", "shikka", operation, *[t["label"] for t in targets], "--config-file", str(private)]
+    if args.jobs: command += ["--num-threads", str(args.jobs)]
+    command += args.buck_arg
+    if args.command == "outputs": command += ["--show-full-json-output"]
+    # After `--`, `run` arguments reach the program and `test` arguments reach
+    # Buck2's test runner, which sets the environment tests start with.
+    runner = ["--env", "SHIKKA_ENVIRONMENT=" + str(snapshot)] if snapshot else []
+    if runner or passthrough: command += ["--", *runner, *passthrough]
+    return command
+
+
+@contextlib.contextmanager
+def environment_snapshot(root, command):
+    """Cargo starts tests with the caller's environment. Buck2's daemon starts
+    them here and does not have it, so `shikka test` leaves run.py a private
+    snapshot and removes it when the command ends."""
+    if command != "test":
+        yield None
+        return
+    directory = root / "buck-out/shikka"
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, path = tempfile.mkstemp(prefix="test-environment-", dir=directory)  # Created with mode 0600.
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(dict(os.environ), stream)
+        yield path
+    finally:
+        Path(path).unlink(missing_ok=True)
 
 
 def invoke(root, config, tools, args, passthrough):
@@ -131,6 +207,9 @@ def invoke(root, config, tools, args, passthrough):
     for key in list(env):
         if key.startswith("BUCK2_LOCAL_") or key in {"BUCK2_EXTRA_EXTERNAL_CONFIG", "BUCK2_DAEMON_DIR"}:
             env.pop(key)
+    if args.command == "run":
+        # Cargo runs the program where the user is. Buck2 is run from the root.
+        env["SHIKKA_RUN_CWD"] = os.getcwd()
     cache_directory = service.state_directory(args.state_dir or config["state_dir"]) if mode == "managed" else None
     lease = service.lease(cache_directory, args.nativelink or config["nativelink"], args.cache_bytes or config["cache_bytes"]) if mode == "managed" else contextlib.nullcontext(None)
     with lease as local:
@@ -178,22 +257,16 @@ instance_name = shikka
         try:
             os.environ.clear()
             os.environ.update(env)
-            storage.configure_content_store(root, SimpleNamespace(local_content_store=args.local_content_store,
+            storage.configure_content_store(root, SimpleNamespace(local_content_store=args.local_content_store or "auto",
                 local_content_store_max_bytes=None, local_content_store_max_entries=None, isolation_dir="shikka"))
             env = dict(os.environ)
         finally:
             os.environ.clear()
             os.environ.update(old_env)
-        operation = "build" if args.command == "outputs" else args.command
-        command = [config["buck2"], "--isolation-dir", "shikka", operation, *[t["label"] for t in targets], "--config-file", str(private)]
-        if args.jobs: command += ["--num-threads", str(args.jobs)]
-        elif sys.platform == "darwin": command += ["--num-threads", "2"]
-        command += args.buck_arg
-        if args.command == "outputs": command += ["--show-full-json-output"]
-        if passthrough: command += ["--", *passthrough]
         store = env.get("BUCK2_LOCAL_CONTENT_STORE")
         before = Path(store).stat().st_mtime_ns if store else None
-        result = subprocess.run(command, cwd=root, env=env)
+        with environment_snapshot(root, args.command) as snapshot:
+            result = subprocess.run(buck_command(config, args, targets, private, passthrough, snapshot), cwd=root, env=env)
         if content_dirs and journal:
             changed = bool(store) and Path(store).stat().st_mtime_ns != before
             shared = storage.share_with_cas(content_dirs, changed, journal, store)
@@ -202,16 +275,17 @@ instance_name = shikka
 
 
 def parser():
+    # No option defaults here: reject_unused tells a given option from an absent one.
     p = argparse.ArgumentParser(description="Cargo resolves; Shikka builds, caches and shares artifacts.")
     p.add_argument("--version", action="version", version="shikka " + __version__)
-    p.add_argument("--manifest-path", default="Cargo.toml")
+    p.add_argument("--manifest-path", help="init only (default Cargo.toml)")
     for key in ["buck2", "nativelink", "rustc", "cargo", "cc", "cxx", "ar"]: p.add_argument("--" + key)
-    p.add_argument("--profile", default="dev", choices=["dev", "release"])
+    p.add_argument("--profile", choices=["dev", "release"], help="default dev; test always uses Cargo's test profile")
     p.add_argument("-p", "--package", action="append", default=[])
     p.add_argument("--bin")
     p.add_argument("--jobs", "-j", type=int)
-    p.add_argument("--features", default="")
-    p.add_argument("--no-default-features", action="store_true")
+    p.add_argument("--features", help="init only")
+    p.add_argument("--no-default-features", action="store_true", help="init only")
     p.add_argument("--offline", action="store_true")
     p.add_argument("--cache", choices=["off", "managed", "remote"])
     p.add_argument("--cache-write", action=argparse.BooleanOptionalAction, default=None)
@@ -219,7 +293,7 @@ def parser():
     p.add_argument("--cache-bytes", type=int, default=None)
     p.add_argument("--config-file")
     p.add_argument("--no-local-cas", action="store_true", help="Use cache transport without filesystem sharing")
-    p.add_argument("--local-content-store", default="auto")
+    p.add_argument("--local-content-store", help="auto (default), off, or a directory")
     p.add_argument("--all-units", action="store_true")
     p.add_argument("--buck-arg", action="append", default=[])
     p.add_argument("command", choices=["init", "generate", "check", "build", "test", "run", "outputs", "targets", "cache"])
@@ -235,6 +309,9 @@ def main():
             index = argv.index("--")
             argv, passthrough = argv[:index], argv[index + 1:]
         args = parser().parse_args(argv)
+        reject_unused(args)
+        if passthrough and args.command not in {"run", "test"}:
+            raise ValueError(f"Arguments after -- apply only to shikka run and shikka test, not shikka {args.command}.")
         if args.command == "init":
             args.cache_bytes = args.cache_bytes or 10 * 1024**3
             initialize(args)
@@ -252,7 +329,7 @@ def main():
         config = read(root / ".shikka/project.json")
         tools = read(root / ".shikka/toolchain.json")
         if args.command == "generate":
-            refresh(root, config, tools, offline=args.offline)
+            regenerate(root, config, tools, offline=args.offline)
             print("Cargo graph regenerated")
             return
         if args.command == "check":

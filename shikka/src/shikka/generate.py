@@ -244,8 +244,8 @@ def outside_data(root, package_path):
 
 
 def generate(root, config, tools):
-    from .project import app_inputs, cargo_configs, cargo, owned_write, read, write_json
-    features = (["--features", config["features"]] if config["features"] else [])
+    from .project import app_inputs, cargo_configs, cargo, owned_write, read, tool_identity, write_json
+    features =(["--features", config["features"]] if config["features"] else [])
     if config["no_default_features"]:
         features += ["--no-default-features"]
     common = ["--locked", "--offline", "--manifest-path", config["manifest"]]
@@ -327,6 +327,7 @@ def generate(root, config, tools):
     for path in [root / ".cargo/config", root / ".cargo/config.toml", root / "rust-toolchain", root / "rust-toolchain.toml"]:
         if path.is_file(): inputs.add(path)
     state = {"schema": 1, "cargo_configs": cargo_configs(root), "targets": targets, "units": units_by_profile, "app_inputs": app_inputs(),
+             "toolchain": tool_identity(tools),
              "inputs": {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(inputs)},
              "generated": {p: hashlib.sha256(content.encode()).hexdigest() for p, content in files.items()}}
     write_json(previous_path, state)
@@ -334,7 +335,7 @@ def generate(root, config, tools):
 
 
 def current(root):
-    from .project import app_inputs, cargo_configs, read
+    from .project import app_inputs, cargo_configs, file_identity, read
     path = root / ".shikka/graph.json"
     if not path.exists():
         raise ValueError("No graph; run shikka generate.")
@@ -343,6 +344,10 @@ def current(root):
              if not (root / name).is_file() or hashlib.sha256((root / name).read_bytes()).hexdigest() != expected]
     if state.get("cargo_configs") != cargo_configs(root): stale.append("Cargo configuration files")
     if state["app_inputs"] != app_inputs(): stale.append("Shikka action/generator version")
+    # A compiler replaced at its recorded path would otherwise keep the action
+    # identities, and so the cached outputs, of the one it replaced.
+    replaced = sorted(name for name, recorded in state.get("toolchain", {}).items() if file_identity(recorded["tool"]) != recorded)
+    if replaced: stale.append("Toolchain files replaced on disk: " + ", ".join(replaced))
     if stale:
         raise ValueError("Build inputs changed; run shikka generate:\n" + "\n".join(stale))
     return state

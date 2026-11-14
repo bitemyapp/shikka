@@ -56,11 +56,42 @@ def output(command):
     return subprocess.check_output(command, text=True).strip()
 
 
-def toolchain(args, root):
-    defaults = read(os.environ["SHIKKA_TOOLCHAIN"]) if os.environ.get("SHIKKA_TOOLCHAIN") else {}
+TOOLS = [("rustc", "rustc"), ("cargo", "cargo"), ("cc", "cc"), ("cxx", "c++"), ("ar", "ar")]
+
+
+def packaged_toolchain():
+    return read(os.environ["SHIKKA_TOOLCHAIN"]) if os.environ.get("SHIKKA_TOOLCHAIN") else {}
+
+
+def requested_tools(args):
+    """The tool choices `init` records in project.json, and the PATH actions use.
+
+    A choice is an absolute path, so a later `generate` resolves the same file
+    whatever shell it runs in. It names the file the user would run (a rustup
+    proxy stays a proxy), not what that dispatches to today. None defers to the
+    packaged toolchain, which a newer package may replace.
+    """
+    defaults = packaged_toolchain()
+    tools = {}
+    for key, default in TOOLS:
+        chosen = getattr(args, key, None)
+        tools[key] = executable(chosen, default) if chosen or not defaults.get(key) else None
+    return tools, None if defaults.get("BUILD_PATH") else os.environ.get("PATH", "")
+
+
+def toolchain(config, root, recorded=None):
+    """Resolve and probe the project's recorded tool choices.
+
+    Both `init` and `generate` run this. Compiler paths can outlive the
+    compiler they named (rustup and system packages update in place), so the
+    probed versions, and with them every action's identity, are only as fresh
+    as the last run. `tool_identity` lets builds notice when that is stale.
+    """
+    defaults = packaged_toolchain()
+    requested = config.get("tools") or {}
     tools = dict(defaults)
-    for key, default in [("rustc", "rustc"), ("cargo", "cargo"), ("cc", "cc"), ("cxx", "c++"), ("ar", "ar")]:
-        tools[key] = executable(getattr(args, key, None) or tools.get(key), default)
+    for key, default in TOOLS:
+        tools[key] = executable(requested.get(key) or defaults.get(key), default)
     # Resolve rustup's dispatchers while the caller's project/toolchain context
     # is available. Compiler actions deliberately have a private HOME.
     sysroot = Path(subprocess.check_output([tools["rustc"], "--print", "sysroot"], cwd=root, text=True).strip())
@@ -75,7 +106,9 @@ def toolchain(args, root):
     version = output([tools["rustc"], "-vV"])
     tools["target"] = next(line.split(": ", 1)[1] for line in version.splitlines() if line.startswith("host: "))
     tools["rustlib"] = output([tools["rustc"], "--print", "target-libdir"])
-    tools["BUILD_PATH"] = tools.get("BUILD_PATH", os.environ.get("PATH", ""))
+    # The PATH recorded at init stays the actions' PATH: the shell that happens
+    # to run `generate` must not change every action's identity.
+    tools["BUILD_PATH"] = defaults.get("BUILD_PATH") or config.get("build_path") or (recorded or {}).get("BUILD_PATH") or os.environ.get("PATH", "")
     tools["versions"] = {"rustc": version, "cargo": output([tools["cargo"], "-V"]), "cc": output([tools["cc"], "--version"])}
     if sys.platform == "darwin":
         tools["SDKROOT"] = output(["xcrun", "--sdk", "macosx", "--show-sdk-path"])
@@ -90,6 +123,31 @@ def toolchain(args, root):
     else:
         raise ValueError("Shikka currently supports Linux and macOS.")
     return tools
+
+
+def file_identity(tool):
+    """What `tool` names now: its resolved file, size and modification time."""
+    path = os.path.realpath(tool)
+    try:
+        status = os.stat(path)
+    except OSError:
+        return {"tool": tool, "path": path}
+    return {"tool": tool, "path": path, "size": status.st_size, "mtime_ns": status.st_mtime_ns}
+
+
+def tool_identity(tools):
+    """File identities of the probed tools, for noticing an in-place update.
+
+    Stored with the graph state, not in toolchain.json: modification times are
+    facts about this host and must not enter an action's identity.
+    """
+    paths = {key: tools[key] for key, _ in TOOLS}
+    if sys.platform == "darwin":
+        # /usr/bin/cc is a fixed shim. An Xcode or Command Line Tools update
+        # replaces the compiler and SDK it dispatches to.
+        paths["developer cc"] = output(["xcrun", "--find", "cc"])
+        paths["sdk"] = os.path.join(tools["SDKROOT"], "SDKSettings.json")
+    return {name: file_identity(path) for name, path in paths.items()}
 
 
 def find_root():
