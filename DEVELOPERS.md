@@ -160,6 +160,11 @@ that. `cargo_build` is the complete compilation, whose library is what gets
 linked. Which units are libraries in this sense is Cargo's own rule, written
 down in `_library` in `units.bzl`.
 
+Selecting a library still builds the objects of all its dependencies. These
+are required outputs of the selected target, rather than inputs of its
+compiler action: analysis can start early, but a build cannot report success
+while a dependency's code generation is missing or has failed.
+
 The price is each library's analysis run twice. That is idle time put to use
 where the build cannot fill the machine, and a slower build where it can, so
 `--pipelining auto`, the default, turns it on where the machine has 64 or

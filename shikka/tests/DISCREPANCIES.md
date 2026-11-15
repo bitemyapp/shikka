@@ -37,6 +37,7 @@ record commands, duration and status. `SHIKKA_TEST_LIGHT=1` uses the reviewed
 | Build script: compiled-in manifest directory; workspace lockfile and local dependency source | fixture build scripts | executed | executed |
 | Cargo's `prefer-dynamic` rule; package settings; workspace layout for a build script; Cargo and rustup run in the workspace; a Nix-store tool keeps its name, and rustc its default linker | test_frontend.py | executed | executed |
 | A library below a library: generic and non-inlined calls, with pipelining on and off; with it, metadata identical from both actions | stdout comparison, qualify.py | differential | light fixture |
+| Selecting a library alone still rejects code-generation failures in a dependency, and recovers after the source is restored | qualify.py, invalid inline assembly | differential | light fixture |
 | A build script's `NUM_JOBS` and jobserver; rustc's output kinds for a library's two actions; which of the two shows its errors; the pipelining default | test_frontend.py | executed | executed |
 | Service ownership, concurrent startup, mTLS, active-build stop guard, restart | test_service.py | real NativeLink | real NativeLink |
 

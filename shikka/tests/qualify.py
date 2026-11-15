@@ -71,6 +71,23 @@ with tempfile.TemporaryDirectory(prefix="shikka-qualification-") as directory:
             run(build + ["--pipelining", choice, "test"])
         early, complete = library_metadata()
         assert early and all(len(copies) == 1 and complete.get(name) == copies for name, copies in early.items()), sorted(early)
+        # Selecting only a library must still finish its dependencies' code
+        # generation. An invalid instruction reaches the assembler only during
+        # code generation, so metadata alone succeeds. Both supported native
+        # architectures (x86_64 and aarch64) accept Rust's inline asm syntax.
+        leaf = root / "leaf/src/lib.rs"
+        original = leaf.read_text()
+        leaf.write_text(original + '''
+pub fn codegen_failure() { unsafe { std::arch::asm!("shikka_invalid_instruction"); } }
+''')
+        try:
+            if not light:
+                run([cargo, "build", "--offline", "-p", "helper"], success=False, message="shikka_invalid_instruction")
+            for choice in ["on", "off"]:
+                run(build + ["--pipelining", choice, "-p", "helper", "build"], success=False, message="shikka_invalid_instruction")
+        finally:
+            leaf.write_text(original)
+        run(build + ["--pipelining", "on", "-p", "helper", "build"])
         # init recorded the choice; a command's own option overrides it for that command.
         settings = project / ".shikka/project.json"
         recorded = settings.read_text()

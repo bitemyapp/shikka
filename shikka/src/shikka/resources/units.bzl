@@ -143,7 +143,11 @@ def _unit_impl(ctx):
         _run(ctx, spec, manifest, closure, incremental, category, "", ["--output", output.as_output()])
     executable = output.project(spec["filename"]) if spec["filename"] else None
     providers = [
-        DefaultInfo(default_output = executable if executable else output, other_outputs = [output]),
+        # A selected library must finish its dependencies' code generation,
+        # even when nothing links it in this command. Keep these requirements
+        # on the target, not the compiler action, so metadata can still unblock
+        # compilation before the dependency's objects are ready.
+        DefaultInfo(default_output = executable if executable else output, other_outputs = [output] + objects.values()),
         CargoUnitInfo(
             output = output,
             interface = interface,
