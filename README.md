@@ -45,6 +45,13 @@ Buck2 and NativeLink retain their own files and eviction policies. APFS uses
 native clones inside Buck2's output-publication lifecycle. Filesystems without
 these capabilities fall back to ordinary storage and cache transport.
 
+Build scripts compile their C and C++ in parallel, as under Cargo. On a
+machine with 64 or more CPUs, each library's metadata is compiled ahead of
+its code so that the libraries above it start sooner, which is what Cargo's
+pipelining does; `--pipelining on` or `off` overrides the choice. With fewer
+CPUs it stays off, because here it costs each library's analysis a second
+time.
+
 This is an early native Rust importer, not a replacement for every Cargo
 command. It supports dev/release builds, unit/integration tests, build scripts,
 proc macros and resolved features. Run `shikka generate` after manifest,

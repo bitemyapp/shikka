@@ -27,6 +27,7 @@ ACCEPTS = {
     "cache": {"init"} | BUILD, "config_file": {"init"} | BUILD,
     "nativelink": {"init", "cache"} | BUILD, "state_dir": {"init", "cache"} | BUILD, "cache_bytes": {"init", "cache"} | BUILD,
     "cache_write": BUILD, "no_local_cas": BUILD, "local_content_store": BUILD, "jobs": BUILD, "buck_arg": BUILD,
+    "pipelining": {"init"} | BUILD,
     "profile": SELECT - {"test"}, "package": SELECT, "bin": SELECT, "all_units": SELECT,
     "targets": SELECT | {"cache"},
     # Where the project is, not something project.json can change afterwards.
@@ -71,7 +72,7 @@ def initialize(args):
     requested, build_path = requested_tools(args)
     buck2 = executable(args.buck2 or os.environ.get("SHIKKA_DEFAULT_BUCK2"), "buck2")
     config = {"schema": 1, "manifest": manifest.relative_to(root).as_posix(), "workspace": generate.below(root, workspace), "buck2": buck2, "tools": requested, "build_path": build_path,
-              "nativelink": args.nativelink or os.environ.get("SHIKKA_DEFAULT_NATIVELINK"), "cache": args.cache or "off",
+              "nativelink": args.nativelink or os.environ.get("SHIKKA_DEFAULT_NATIVELINK"), "cache": args.cache or "off", "pipelining": args.pipelining or "auto",
               "state_dir": str(Path(args.state_dir).expanduser().resolve()) if args.state_dir else None, "cache_bytes": args.cache_bytes, "config_file": str(Path(args.config_file).expanduser().resolve()) if args.config_file else None,
               "features": args.features or "", "no_default_features": args.no_default_features,
               "profiles": ["dev", "release", "test"]}
@@ -181,6 +182,34 @@ def select(state, args):
     return targets
 
 
+# With fewer CPUs than this, `--pipelining auto` leaves it off.
+PIPELINING_CPUS = 64
+
+
+def available_cpus():
+    """The CPUs this process may use, which is how many actions Buck2 runs at once."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # Not Linux.
+        return os.cpu_count() or 1
+
+
+def pipelined(choice, cpus):
+    """Whether each library gets an action that produces its metadata alone.
+
+    Libraries above it then start when that is written, not when its code is
+    generated, which shortens every chain of libraries. The price is each
+    library's analysis run twice. That is idle time put to use where there
+    are more CPUs than the build can fill, and a slower build where there
+    are not, so by default their number decides. It is the machine's, not
+    `--jobs`: the choice is part of what gets built, and one that followed an
+    option would rebuild whenever a command left the option out.
+    """
+    if choice in ("on", "off"):
+        return choice == "on"
+    return cpus >= PIPELINING_CPUS
+
+
 def buck_command(config, args, targets, private, passthrough, snapshot=None):
     operation = "build" if args.command == "outputs" else args.command
     command = [config["buck2"], "--isolation-dir", "shikka", operation, *[t["label"] for t in targets], "--config-file", str(private)]
@@ -239,6 +268,7 @@ os = {'macos' if sys.platform == 'darwin' else 'linux'}
 arch = {platform.machine()}
 cache = {mode}
 cache_write = {str(writer).lower()}
+pipelining = {str(pipelined(args.pipelining or config.get("pipelining", "auto"), available_cpus())).lower()}
 """
         content_dirs = []
         journal = None
@@ -284,6 +314,8 @@ instance_name = shikka
             os.environ.update(old_env)
         store = env.get("BUCK2_LOCAL_CONTENT_STORE")
         before = Path(store).stat().st_mtime_ns if store else None
+        # Which action showed a library's errors, per build (action.py); none outlives its build.
+        shutil.rmtree(root / "buck-out/shikka/reported", ignore_errors=True)
         with environment_snapshot(root, args.command) as snapshot:
             result = subprocess.run(buck_command(config, args, targets, private, passthrough, snapshot), cwd=root, env=env)
         if content_dirs and journal:
@@ -314,6 +346,7 @@ def parser():
     p.add_argument("--config-file")
     p.add_argument("--no-local-cas", action="store_true", help="Use cache transport without filesystem sharing")
     p.add_argument("--local-content-store", help="auto (default), off, or a directory")
+    p.add_argument("--pipelining", choices=["auto", "on", "off"], help=f"compile each library's metadata in an action of its own, so the libraries above it start sooner; auto (default) is on where there are {PIPELINING_CPUS} CPUs or more; init records the choice")
     p.add_argument("--all-units", action="store_true")
     p.add_argument("--buck-arg", action="append", default=[])
     p.add_argument("command", choices=["init", "generate", "check", "build", "test", "run", "outputs", "targets", "cache"])

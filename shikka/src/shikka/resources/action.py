@@ -189,6 +189,35 @@ def assemble_workspace(workspace, sources):
                 (target / name).symlink_to(os.path.relpath(os.path.join(directory, name), target))
 
 
+def job_count():
+    """The CPUs this process may use: what Cargo's default -j is to a build script."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # Not Linux.
+        return os.cpu_count() or 1
+
+
+def run_with_jobserver(command, jobs, env, **options):
+    """Run a build script with the parallelism Cargo gives one.
+
+    Cargo sets NUM_JOBS and passes a GNU make jobserver in CARGO_MAKEFLAGS;
+    the cc and cmake crates and make itself compile in parallel through them,
+    and serially without. The jobserver is this script's own: an inherited
+    pipe, the form every make understands, holding one token for each job
+    beyond the script's own. Neither value is part of the action's identity,
+    as neither is part of a Cargo fingerprint.
+    """
+    read, write = os.pipe()
+    try:
+        os.write(write, b"|" * (min(jobs, 1024) - 1))
+        auth = str(read) + "," + str(write)
+        env = dict(env, NUM_JOBS=str(jobs), CARGO_MAKEFLAGS="-j --jobserver-fds=" + auth + " --jobserver-auth=" + auth)
+        return subprocess.run(command, env=env, pass_fds=(read, write), **options)
+    finally:
+        os.close(read)
+        os.close(write)
+
+
 def run_script(payload, output, env, tools, root):
     unit = payload["unit"]
     manifest = Path(payload["source"]).absolute()
@@ -207,7 +236,7 @@ def run_script(payload, output, env, tools, root):
     if "abi_target" in unit:
         flags += ["-C", "metadata=" + codegen["key"], "-C", "extra-filename=-" + codegen["key"]]
     env.update(cfg_environment(tools, flags))
-    env.update(OUT_DIR=str(out_dir), HOST=tools["target"], TARGET=unit.get("platform") or tools["target"], PROFILE="debug" if codegen["profile"]["name"] in ["dev", "test"] else "release", OPT_LEVEL=codegen["profile"]["opt_level"], DEBUG=str(codegen["profile"]["debuginfo"] not in [0, "none"]).lower(), NUM_JOBS="1", CARGO_ENCODED_RUSTFLAGS="\x1f".join(flags))
+    env.update(OUT_DIR=str(out_dir), HOST=tools["target"], TARGET=unit.get("platform") or tools["target"], PROFILE="debug" if codegen["profile"]["name"] in ["dev", "test"] else "release", OPT_LEVEL=codegen["profile"]["opt_level"], DEBUG=str(codegen["profile"]["debuginfo"] not in [0, "none"]).lower(), CARGO_ENCODED_RUSTFLAGS="\x1f".join(flags))
     for feature in unit["features"]:
         env["CARGO_FEATURE_" + feature.upper().replace("-", "_")] = "1"
     executable = None
@@ -224,7 +253,7 @@ def run_script(payload, output, env, tools, root):
             executable = directory / dep["filename"]
     if executable is None:
         raise ValueError("Cargo unit has no build-script executable")
-    completed = subprocess.run([str(executable)], cwd=manifest, env=env, text=True, stdout=subprocess.PIPE)
+    completed = run_with_jobserver([str(executable)], job_count(), env, cwd=manifest, text=True, stdout=subprocess.PIPE)
     (output / "stdout").write_text(relocate(completed.stdout, root, output, encode=True))
     completed.check_returncode()
     result = script_instructions(completed.stdout)
@@ -271,7 +300,60 @@ def write_dependencies(raw, destination, root):
     Path(destination).write_text("".join(path + "\n" for path in sorted(paths)))
 
 
-def compile_unit(payload, output, env, tools, root, dep_file, incremental_directory):
+class CompileFailed(Exception):
+    """rustc failed and has said why. Nothing is added but its exit status."""
+
+    def __init__(self, unit, returncode, diagnostics):
+        super().__init__(unit["package"]["name"])
+        self.unit = unit
+        self.status = returncode if returncode > 0 else 1
+        # None when rustc wrote to this action's stderr itself.
+        self.diagnostics = diagnostics
+
+    def marker(self):
+        """A name the two actions of one library share within one build."""
+        build, scratch = os.environ.get("BUCK_BUILD_ID"), os.environ.get("BUCK_SCRATCH_PATH")
+        if not build or not scratch or len(Path(scratch).parts) < 2:
+            return None
+        return Path(*Path(scratch).parts[:2]) / "reported" / (self.unit["key"] + "." + build)
+
+    def report(self):
+        """Show the errors, unless this library's other action already has.
+
+        With pipelining both of a library's actions run its analysis, at the
+        same time, and fail with the same errors. The first to fail shows
+        them and then leaves a marker; the other says where they are. If the
+        two cannot tell, both show them.
+        """
+        if self.diagnostics is None:
+            return
+        marker = self.marker()
+        if marker is not None and marker.exists():
+            print("error: could not compile `" + self.unit["package"]["name"] + "`; its errors are in this library's other failed action", file=sys.stderr)
+            return
+        sys.stderr.buffer.write(self.diagnostics)
+        sys.stderr.flush()
+        if marker is not None:
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.touch()
+            except OSError:
+                pass
+
+
+def metadata_name(unit):
+    """The metadata file rustc writes beside a library."""
+    return unit["filename"].removesuffix(".rlib") + ".rmeta"
+
+
+def compile_unit(payload, output, env, tools, root, dep_file, incremental_directory, pipelined=None):
+    """Compile one unit into `output`.
+
+    A pipelined library has two actions. "metadata" stops before code
+    generation and leaves the library's metadata, which the libraries above
+    it compile against. "objects" is the complete compilation; its library is
+    what programs link.
+    """
     unit = payload["unit"]
     target = unit["target"]
     manifest = Path(payload["source"]).absolute()
@@ -280,10 +362,22 @@ def compile_unit(payload, output, env, tools, root, dep_file, incremental_direct
     if incremental_directory is not None:
         flags += ["-C", "incremental=" + str(incremental_directory)]
     raw_dep_file = output / "rustc.d"
-    emit = "link,dep-info=" + str(raw_dep_file) if dep_file is not None else "link"
+    if pipelined:
+        # Both of a library's actions ask rustc for the same kinds of output:
+        # the kinds are part of the crate hash its dependents record, and a
+        # dependent compiled against one action's metadata links the other's
+        # objects.
+        emit = "dep-info=" + str(raw_dep_file) + ",metadata,link"
+    else:
+        emit = "link,dep-info=" + str(raw_dep_file) if dep_file is not None else "link"
     args = [tools["rustc"], str(manifest / target["src_path"]), "--crate-name", target["name"].replace("-", "_"), "--edition=" + target["edition"], "--emit=" + emit, "-C", "metadata=" + unit["key"], "-C", "extra-filename=-" + unit["key"], "--out-dir", str(output), "-C", "linker=" + tools["cc"], *flags]
     # Rustc tracks the actual working directory independently of argv paths.
     args += ["--remap-path-prefix", "/proc/self/cwd=.", "-Z", "remap-cwd-prefix=."]
+    if pipelined == "metadata":
+        # Everything but code generation. The metadata is byte for byte what
+        # the complete compilation writes beside its library; qualify.py
+        # compares the two.
+        args += ["-Z", "no-codegen"]
     if unit["mode"] == "test":
         args.append("--test")
     else:
@@ -339,7 +433,10 @@ def compile_unit(payload, output, env, tools, root, dep_file, incremental_direct
         elif "bin" in dep["target"]["kind"]:
             env["CARGO_BIN_EXE_" + dep["target"]["name"]] = str(directory / dep["filename"])
         else:
-            args += ["--extern", edge["extern_crate_name"] + "=" + str(directory / dep["filename"])]
+            # `directory` holds the dependency's metadata or its output, as
+            # the rule chose for this unit.
+            filename = metadata_name(dep) if dependency.get("metadata") else dep["filename"]
+            args += ["--extern", edge["extern_crate_name"] + "=" + str(directory / filename)]
     if unit["package"]["external"]:
         args += ["--cap-lints", "allow"]
     # Linux process-relative paths keep ordinary build identities relocatable.
@@ -359,10 +456,22 @@ def compile_unit(payload, output, env, tools, root, dep_file, incremental_direct
                 env.update(CARGO_MANIFEST_DIR=".", CARGO_MANIFEST_PATH="Cargo.toml")
     else:
         args += ["--remap-path-prefix", str(root) + "=."]
-    subprocess.run(args, env=env, check=True)
+    # A pipelined library's diagnostics are held until it is known who shows them.
+    completed = subprocess.run(args, env=env, stderr=subprocess.PIPE if pipelined else None)
+    if completed.returncode:
+        raise CompileFailed(unit, completed.returncode, completed.stderr)
+    if completed.stderr:
+        sys.stderr.buffer.write(completed.stderr)
     if dep_file is not None:
         write_dependencies(raw_dep_file, dep_file, root)
-        raw_dep_file.unlink()
+    raw_dep_file.unlink(missing_ok=True)
+    if pipelined and not (output / metadata_name(unit)).exists():
+        raise RuntimeError("rustc did not produce expected metadata " + metadata_name(unit))
+    if pipelined == "metadata":
+        # What -Z no-codegen leaves in place of the library: an archive of
+        # the metadata alone, which nothing may link.
+        (output / unit["filename"]).unlink(missing_ok=True)
+        return
     if not (output / unit["filename"]).exists():
         raise RuntimeError("rustc did not produce expected output " + unit["filename"])
 
@@ -414,6 +523,7 @@ def main():
     parser.add_argument("--environment", required=True)
     parser.add_argument("--spec", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--pipelined", choices=["objects", "metadata"])
     parser.add_argument("--dep-file")
     parser.add_argument("--incremental-directory")
     args = parser.parse_args()
@@ -456,7 +566,7 @@ def main():
         try:
             if incremental_directory is not None:
                 own_readonly_incremental_files(incremental_directory, env)
-            compile_unit(payload, output, env, tools, root, args.dep_file, incremental_directory)
+            compile_unit(payload, output, env, tools, root, args.dep_file, incremental_directory, args.pipelined)
         except BaseException:
             if incremental_directory is not None:
                 if output.exists():
@@ -464,6 +574,9 @@ def main():
                 if args.dep_file:
                     Path(args.dep_file).unlink(missing_ok=True)
             raise
+    if args.pipelined == "metadata":
+        # Metadata is all this action leaves; the unit's record goes with its objects.
+        return
     info = {"filename": payload["unit"]["filename"], "library_paths": library_paths,
             "manifest": str(Path(payload["source"]).absolute()),
             "cargo_environment": package_environment(payload["unit"], Path(payload["source"]).absolute())}
@@ -478,4 +591,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CompileFailed as failure:
+        failure.report()
+        sys.stderr.flush()
+        # At once: the other action defers to this one from here on.
+        os._exit(failure.status)

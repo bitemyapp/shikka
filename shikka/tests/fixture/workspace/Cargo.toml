@@ -1,5 +1,5 @@
 [workspace]
-members = ["helper", "macros"]
+members = ["helper", "leaf", "macros"]
 resolver = "3"
 [package]
 name = "shikka-fixture"

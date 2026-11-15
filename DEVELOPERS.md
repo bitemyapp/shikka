@@ -136,6 +136,85 @@ an existing unowned file. Cargo workspaces stay separate. Shikka writes nothing
 to a project's Cargo manifests; it reads `[package.metadata.shikka]` where the
 project has added it.
 
+## Scheduling
+
+Each Cargo unit is one Buck2 action, and Buck2 runs as many at once as there
+are build threads (`-j`, by default the CPUs). Two things Cargo does inside
+that picture are done here as well.
+
+A build script gets `NUM_JOBS` and a GNU make jobserver in `CARGO_MAKEFLAGS`,
+as Cargo gives it; the `cc` and `cmake` crates and `make` compile in parallel
+through them and serially without. The count is the CPUs the action may use.
+The jobserver is that script's own, an inherited pipe with one token for each
+job beyond the script itself, so scripts running at once do not share a
+budget as they do under Cargo. Neither value is part of an action's identity.
+
+Pipelining is the other. A library that depends on a library needs only its
+metadata (`.rmeta`) to compile; the objects are needed by what links: a
+program, a test, a proc macro, a build script, a dylib. Cargo starts the
+library above as soon as rustc reports the metadata written, while the same
+process goes on to generate code. A Buck2 action has no early output, so with
+pipelining a library has two actions. `cargo_metadata` is the compilation
+with `-Z no-codegen`, and leaves the metadata alone; the libraries above read
+that. `cargo_build` is the complete compilation, whose library is what gets
+linked. Which units are libraries in this sense is Cargo's own rule, written
+down in `_library` in `units.bzl`.
+
+The price is each library's analysis run twice. That is idle time put to use
+where the build cannot fill the machine, and a slower build where it can, so
+`--pipelining auto`, the default, turns it on where the machine has 64 or
+more CPUs. `--pipelining on` and `off` choose, for one command or, given to
+`init`, as the project's choice in `project.json`. The number is the
+machine's and not `-j`, so that a command without `-j` builds the same graph
+as one with it. Without pipelining a library is one action, as before, and
+nothing above is different. An action names the directories it
+reads, so a library with library dependencies has a different identity under
+each choice, and machines that choose differently share cached results only
+for the rest.
+
+Two things keep the pair of actions sound. They ask rustc for the same kinds
+of output (`--emit=dep-info,metadata,link`), because the kinds are part of the
+crate hash that dependents record: a library compiled against metadata from
+one set of kinds does not link objects from another (E0460). And the metadata
+`-Z no-codegen` writes is byte for byte what the complete compilation leaves
+beside its library, which `qualify.py` checks on the fixture. A compiler that
+broke either would fail there, or at the first link, not silently.
+
+Measured on 2026-11-15 on a 64-core, 128-thread machine that another job
+kept at a load of 7 to 35, building the 709 units of a 33-program workspace
+in the dev profile, each figure a clean build in seconds:
+
+| | Seconds |
+|---|---|
+| Cargo | 48.9, 49.3 |
+| Before either change | 70.8, 70.8 |
+| Build scripts given jobs, no pipelining | 58.0, 59.2 |
+| Build scripts given jobs, pipelining | 57.2, 58.0, 58.2, 70.9 |
+
+The first change is all of the difference that can be told from the noise
+there: one build script, a CMake build on the longest chain, went from 41 to
+48 seconds to 28 to 32. Pipelining does shorten the longest chain, to 54.8
+seconds from 61.9 in the one pair of runs where both were recorded, and its
+metadata actions added 17% to the compiler's CPU time. With the CPUs limited
+it was 57 to 58 seconds against 59 to 60 on 64 cores, 83 against 74 on 32
+and 141 against 122 on 16, which is where the default comes from. An edit to
+a library whose dependents are programs is not faster with it: programs wait
+for objects either way.
+
+What remains between these figures and Cargo's is mostly not the compiler,
+which takes no longer per unit here. It is what Buck2 does around each
+action, and most of that is the local content store making each new output
+durable before its action completes: with the store off the same clean build
+was 8 to 9 seconds shorter, and an edit to a library that rebuilds 15
+packages took 5.4 to 5.6 seconds instead of 6.8 to 7.5 (Cargo: 4.6 to 4.8).
+
+Both actions run the analysis, so both fail when a library has errors. The
+first to fail shows rustc's output and leaves a marker under
+`buck-out/shikka/reported`, named for the unit and for the build Buck2 says
+the action belongs to; the other says the errors are in the library's other
+failed action. An action that cannot tell shows them. A failed compilation
+exits with rustc's status and nothing more.
+
 ## Cache and filesystem contract
 
 `--cache off` is the default. `--cache managed` uses a per-user NativeLink 1.8.3

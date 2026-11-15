@@ -6,6 +6,7 @@ edition = "2024"
 answer = []
 [dependencies]
 outside = { path = "../../outside" }
+leaf = { path = "../leaf" }
 # build.rs reads the workspace's lockfile and a local dependency's source.
 [package.metadata.shikka]
 build-script-reads-workspace = true

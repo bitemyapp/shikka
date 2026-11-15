@@ -15,6 +15,8 @@ build contract; it does not certify full Cargo compatibility.
 | DISC-007 | One project root holds every local package | A path dependency outside the Cargo workspace needs `init --root DIR`; `init` refuses a root that cannot hold one before writing anything. Cargo and rustup still run in the workspace |
 | DISC-008 | The graph is `cargo build --workspace` | Every member is a package Cargo was asked to build, so a member's dylib is not given `-C prefer-dynamic`, as it would be when built only as a dependency by `cargo build -p`. One that others link asks for it in `rustflags` |
 | DISC-009 | A build script's inputs are its package, plus what its manifest declares | `build-script-reads-workspace` adds the workspace manifest, lockfile and local dependency sources. Other files outside the package are not there. On Linux a manifest directory compiled into a build script (`env!`) is `.`: right where the script runs, but not absolute |
+| DISC-010 | A build script's jobserver is its own | Cargo shares one jobserver among every compiler and build script; here each script gets `NUM_JOBS` and a jobserver of that many jobs for itself, and rustc gets none. Several scripts compiling C at once can together use more threads than `-j` |
+| DISC-011 | Pipelining runs a library's analysis twice | A Buck2 action cannot publish its metadata early as one rustc process does under Cargo, so an action of its own writes it. On by default only where there are 64 or more CPUs. A library with errors fails in both actions: one shows them and the other says so |
 
 The fixture is handwritten source, not generated output. `qualify.py` generates
 its reference by running the installed Cargo with the same compiler, compares
@@ -34,6 +36,8 @@ record commands, duration and status. `SHIKKA_TEST_LIGHT=1` uses the reviewed
 | Dylib built as a dependency and proc macro link std dynamically | stdout comparison | differential | light fixture |
 | Build script: compiled-in manifest directory; workspace lockfile and local dependency source | fixture build scripts | executed | executed |
 | Cargo's `prefer-dynamic` rule; package settings; workspace layout for a build script; Cargo and rustup run in the workspace; a Nix-store tool keeps its name, and rustc its default linker | test_frontend.py | executed | executed |
+| A library below a library: generic and non-inlined calls, with pipelining on and off; with it, metadata identical from both actions | stdout comparison, qualify.py | differential | light fixture |
+| A build script's `NUM_JOBS` and jobserver; rustc's output kinds for a library's two actions; which of the two shows its errors; the pipelining default | test_frontend.py | executed | executed |
 | Service ownership, concurrent startup, mTLS, active-build stop guard, restart | test_service.py | real NativeLink | real NativeLink |
 
 These are finite regression checks, not a percentage score against all Cargo
