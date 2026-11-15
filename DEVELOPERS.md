@@ -164,9 +164,47 @@ to its root until embedded Rust paths have a portable relocation contract.
 A Linux build script is compiled with `CARGO_MANIFEST_DIR=.`: it runs in its
 package directory, where the `/proc/self/cwd` path other units get names
 nothing, and `.` is the same in every checkout.
-Btrfs/XFS storage code is imported without behavioral changes. The APFS follow-up
+Btrfs/XFS storage code is as imported except for when the local content store
+syncs, described next. The APFS follow-up
 detaches rustc's hardlinked incremental aliases before capturing publication
 guards; this avoids false concurrent-mutation failures from sibling ctime updates.
+
+The local content store (`--local-content-store`: `auto`, `off` or a
+directory; `auto` is `$XDG_CACHE_HOME/shikka/content-v1` where it can share
+extents with `buck-out`) keeps one copy of each output for every worktree on
+the machine. It does not make an action wait for the disk. An action is
+reported complete once its outputs are published and its new objects are in
+the store's index, before any of that is synced. Each new object is marked
+pending; a background thread syncs pending objects in batches, the first a
+quarter of a second after an object is admitted, and only then clears the
+mark. What that means after a crash:
+
+- If the daemon dies and the machine stays up, nothing is lost. The next
+  engine to open the store syncs what was still pending.
+- After a power loss or kernel crash, the store deletes every object still
+  marked pending when it is next opened. Those are cache misses, built or
+  admitted again. The store does not keep an object whose bytes may be torn.
+- An evicted object's removal is synced before its space and name are reused,
+  on the action's path. That is what makes an unmarked object a synced one.
+- The store never syncs files in `buck-out`. After a power loss they can be
+  missing or short, as they can with the store off; Buck2's own record of
+  `buck-out` has never been synced either.
+- Whatever the store publishes into a worktree is a private copy-on-write
+  snapshot whose digest was checked first, whether or not its object is still
+  pending.
+
+A file restored from a remote cache is still synced before it is renamed into
+place, with the store on or off. An engine from before this change may share
+the directory: it syncs before it publishes and ignores the marks, so after a
+power loss it can keep an object a newer engine had not yet synced. If that
+object is torn, its first use fails the digest check once and removes it.
+
+Measured on 2026-11-15 on a 64-core machine by tracing the daemon through one
+clean build of a 33-program workspace and four rebuilds after an edit: the
+store made 103,409 `fsync` calls before this change, every one on the path of
+an action, and 311 on that path after it, with 23,820 more on the background
+thread. The 311 are evictions, which the 10 GiB default cap forces on that
+workspace's rebuilds, and SQLite's own checkpoints.
 
 ## Nix binary cache
 
