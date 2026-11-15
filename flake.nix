@@ -7,7 +7,8 @@
   };
   outputs = { self, nixpkgs, rust-overlay }:
     let
-      systems = [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
+      # Not x86_64-darwin: the pinned Nixpkgs no longer evaluates for it.
+      systems = [ "x86_64-linux" "aarch64-darwin" ];
       forAll = nixpkgs.lib.genAttrs systems;
       packagesFor = system:
         let

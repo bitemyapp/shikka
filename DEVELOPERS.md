@@ -29,7 +29,8 @@ fork a second Cargo dependency resolver or embed the NativeLink server in Buck2.
 
 `nix build .#shikka --no-update-lock-file` builds the executable with the pinned
 Buck2 fork and native Rust/C toolchain. `nix build .#buck2` builds just the engine.
-Outputs are defined for x86_64 Linux and Apple/Intel macOS; the extracted Nix
+Outputs are defined for x86_64 Linux and Apple-silicon macOS, not Intel macOS,
+which the pinned Nixpkgs has dropped; the extracted Nix
 package has been exercised on x86_64 Linux, not Nix-on-Darwin.
 
 The Nix package's toolchain is a default. It has a compiler and a C toolchain
