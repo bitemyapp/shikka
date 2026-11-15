@@ -1,13 +1,16 @@
 # Developing Shikka
 
-Work on a `codex/` topic branch from main and submit it for review. Branches
-are squash-merged. Before squashing one that imports or changes the engine,
-tag its head `import/NAME`, where the branch is `codex/NAME`, and push the
-tag: `shikka/engine-origin.json` and the qualification reports cite individual
-commits, and the provenance of the engine is checkable only while the import
-commit, whose tree is upstream plus the recorded patches, stays in the
-repository. The first import is under `import/standalone-cargo`. Never move or
-delete an `import/` tag.
+Work on a `codex/` topic branch from main and submit it for review. A branch
+lands on main squashed or rebased. There are no merge commits, ever: not on
+main, and not to bring a branch up to date, which is a rebase.
+
+Either way of landing gives the commits new names. Before a branch that
+imports or changes the engine lands, tag its head `import/NAME`, where the
+branch is `codex/NAME`, and push the tag: `shikka/engine-origin.json` and the
+qualification reports cite individual commits, and the provenance of the
+engine is checkable only while the import commit, whose tree is upstream plus
+the recorded patches, stays in the repository. The first import is under
+`import/standalone-cargo`. Never move or delete an `import/` tag.
 
 Release publication is inhibited. Upstream workflows are kept
 as reference in `.github/upstream-workflows`, outside GitHub's workflow discovery
