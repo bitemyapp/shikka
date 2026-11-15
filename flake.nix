@@ -85,6 +85,11 @@
         # The publisher's tests build derivations in a store of their own,
         # which Nix can only do on Linux.
         cache-publication = import ./nix/cache/tests.nix { pkgs = pkgsFor system; };
+        cache-push-guards = import ./nix/cache/guard-tests.nix {
+          pkgs = pkgsFor system;
+          settings = cache;
+          push = import ./nix/cache/push.nix { pkgs = pkgsFor system; settings = cache; };
+        };
       });
     };
 }

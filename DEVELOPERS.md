@@ -180,9 +180,11 @@ or the cache of build actions described above.
 It holds only what cache.nixos.org lacks of the package's runtime closure. On
 x86_64 Linux that is three paths of 119: the engine, the frontend and the
 default toolchain file, 43 MB compressed. The engine's source is the
-repository without `shikka/`, `nix/`, the flake and the top-level documents
-(`nix/engine.nix`), so a commit that touches only those keeps the engine's
-store path and publishes no new engine. Build inputs such as the pinned
+repository without `shikka/`, `nix/`, `.github/`, the flake and its lock, and
+`README.md`, `DEVELOPERS.md` and `AGENTS.md` (`nix/engine.nix`), so a commit
+that touches only those keeps the engine's store path and publishes no new
+engine. Any other file, `CHANGELOG.md` and `docs/` included, is part of the
+engine's source. Build inputs such as the pinned
 nightly compiler are not published: changing the engine still means building
 it.
 
@@ -217,9 +219,9 @@ which no cache has.
    served with an archive of the advertised length, and Nix downloads the
    published ones to verify their contents and signatures.
 
-Before any of that it compares the signing key with the public key in
-`settings.nix` and stops if they differ, unless `SHIKKA_CACHE_URL` names a
-trial cache.
+Before any of that it stops unless the cache it reads and the bucket it
+writes are both Shikka's or both a trial's, and, for Shikka's, unless the
+signing key is the one whose public half is in `settings.nix`.
 
 Run it once on each platform. Only x86_64 Linux has been built and published;
 the macOS packages have not been built at all.
@@ -245,11 +247,13 @@ It needs two credentials, neither of which belongs in the repository:
 
 `nix build .#checks.x86_64-linux.cache-publication` runs the publisher's
 tests, which make real stores, keys and caches in the build's own directory
-and use no network. To try the whole command, point it at another cache with
-`SHIKKA_CACHE_URL` and `SHIKKA_CACHE_BUCKET` (and `SHIKKA_CACHE_ENDPOINT` and
-`SHIKKA_CACHE_PROFILE` for another account). The two must name the same
-cache, or paths the bucket lacks look published. `rclone serve s3` over a
-directory, read back as a `file://` cache, is enough.
+and use no network. `checks.x86_64-linux.cache-push-guards` runs the command
+itself up to its build, with each combination it must refuse. To try the
+whole command, point it at another cache with `SHIKKA_CACHE_URL` and
+`SHIKKA_CACHE_BUCKET` together, and `SHIKKA_CACHE_ENDPOINT` and
+`SHIKKA_CACHE_PROFILE` for another account. The trial bucket needs another
+name than Shikka's. `rclone serve s3` over a directory, read back over HTTP
+or as a `file://` cache, is enough.
 
 Nothing removes old paths from the bucket. Do not use R2 lifecycle rules for
 that: a path that has not changed keeps its first upload date while still in

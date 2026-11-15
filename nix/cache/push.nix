@@ -15,13 +15,26 @@ pkgs.writeShellApplication {
     flake=''${1:-.}
     config=''${SHIKKA_CACHE_CONFIG:-''${XDG_CONFIG_HOME:-$HOME/.config}/shikka-cache}
     key=$config/${settings.keyName}.sec
-    # SHIKKA_CACHE_URL is where the bucket is read from; set it with
-    # SHIKKA_CACHE_BUCKET for a test cache, as the two must be the same one or
-    # paths the bucket lacks look published.
+    # SHIKKA_CACHE_URL is where the bucket is read from and
+    # SHIKKA_CACHE_BUCKET where it is written. A trial cache sets both.
     url=''${SHIKKA_CACHE_URL:-${settings.url}}
+    url=''${url%/}
     endpoint=''${SHIKKA_CACHE_ENDPOINT:-${settings.endpoint}}
     bucket=''${SHIKKA_CACHE_BUCKET:-${settings.bucket}}
     profile=''${SHIKKA_CACHE_PROFILE:-shikka-cache}
+    # Reading one cache and writing another publishes nothing useful, or the
+    # wrong thing: paths the bucket lacks look published, or a trial's
+    # paths land in Shikka's bucket. A bucket of that name is Shikka's
+    # whatever endpoint it is reached by.
+    reads=trial
+    writes=trial
+    if [[ $url == '${settings.url}' ]]; then reads=shikka; fi
+    if [[ $bucket == '${settings.bucket}' ]]; then writes=shikka; fi
+    if [[ $reads != "$writes" ]]; then
+      echo "shikka-push-cache: $url and the bucket $bucket are not the same cache;" \
+        "set both SHIKKA_CACHE_URL and SHIKKA_CACHE_BUCKET for a trial, neither to publish" >&2
+      exit 1
+    fi
     if [[ ! -r $key ]]; then
       echo "shikka-push-cache: signing key $key is missing" >&2
       exit 1
@@ -29,7 +42,7 @@ pkgs.writeShellApplication {
     # A path published under another key is one nobody trusts, and it would
     # stay: published paths are not replaced. A trial cache may use any key.
     public=$(nix key convert-secret-to-public < "$key")
-    if [[ -z ''${SHIKKA_CACHE_URL:-} && $public != '${settings.publicKey}' ]]; then
+    if [[ $writes == shikka && $public != '${settings.publicKey}' ]]; then
       echo "shikka-push-cache: $key is not the key the flake advertises for ${settings.url}" >&2
       exit 1
     fi
