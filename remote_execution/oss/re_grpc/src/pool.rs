@@ -209,6 +209,10 @@ fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
     // be set here instead of on the endpoint
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    // Tonic's own connector turns Nagle's algorithm off; this one replaces it.
+    // Left on, a request whose headers and message leave in separate writes
+    // waits for the server's delayed ACK, about 40 ms on every call.
+    http.set_nodelay(true);
     let connector = CountingConnector::new(http);
 
     // We need to use a lazy channel so the pool isn't blocked waiting for new

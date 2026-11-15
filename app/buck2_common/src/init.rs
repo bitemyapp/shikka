@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -623,6 +624,17 @@ impl HydrationConfig {
 #[derive(Allocative, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonStartupConfig {
     pub buck_settings: BuckSettings,
+    pub remote_execution_config_digest: String,
+    pub local_content_store: Option<String>,
+    pub local_content_store_max_bytes: Option<String>,
+    pub local_content_store_max_entries: Option<String>,
+    /// The private layer `BUCK2_EXTRA_EXTERNAL_CONFIG` names. The daemon reads it from its
+    /// own environment, so a client naming another layer needs another daemon.
+    pub extra_external_config: Option<String>,
+    /// A NativeLink CAS content directory on this host, cloned instead of downloaded.
+    pub local_cas_dir: Option<String>,
+    /// Where the cache uploader lists outputs it found in that CAS.
+    pub local_cas_journal: Option<String>,
     pub num_tokio_workers: Option<usize>,
     pub daemon_buster: Option<String>,
     pub digest_algorithms: Option<String>,
@@ -640,11 +652,58 @@ pub struct DaemonStartupConfig {
     pub hydration: Option<HydrationConfig>,
 }
 
+// Only the digest crosses the daemon startup protocol, never credential values.
+// Hash parsed values, not file paths or formatting, to preserve equivalent clients.
+fn remote_execution_config_digest(
+    config: &LegacyBuckConfig,
+    project_root: &Path,
+) -> buck2_error::Result<String> {
+    let mut digest = blake3::Hasher::new();
+    if let Some(section) = config.get_section("buck2_re_client") {
+        for (key, value) in section.iter() {
+            // An unset variable or unreadable credential file fails only when the RE
+            // client is built, as upstream; a local-only command must not fail on it.
+            // Markers keep such inputs distinct, and a later fix still restarts the daemon.
+            let value = match buck2_util::env_vars::substitute_env_vars(value.as_str()) {
+                Ok(value) => value,
+                Err(_) => {
+                    digest.update(b"unsubstituted");
+                    value.as_str().to_owned()
+                }
+            };
+            digest.update(&(key.len() as u64).to_le_bytes());
+            digest.update(key.as_bytes());
+            digest.update(&(value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+            if matches!(key, "tls_ca_certs" | "tls_client_cert") && !value.is_empty() {
+                let path = Path::new(&value);
+                let contents = if path.is_absolute() {
+                    std::fs::read(path)
+                } else {
+                    std::fs::read(project_root.join(path))
+                };
+                match contents {
+                    Ok(contents) => {
+                        digest.update(b"contents");
+                        digest.update(&(contents.len() as u64).to_le_bytes());
+                        digest.update(&contents);
+                    }
+                    Err(_) => {
+                        digest.update(b"unreadable");
+                    }
+                }
+            }
+        }
+    }
+    Ok(digest.finalize().to_hex().to_string())
+}
+
 impl DaemonStartupConfig {
     pub fn new(
         config: &LegacyBuckConfig,
         settings: &BuckSettings,
         paranoid: bool,
+        project_root: &Path,
     ) -> buck2_error::Result<Self> {
         // Intepreted client side because we need the value here.
 
@@ -690,6 +749,15 @@ impl DaemonStartupConfig {
 
         Ok(Self {
             buck_settings: settings.dupe(),
+            remote_execution_config_digest: remote_execution_config_digest(config, project_root)?,
+            local_content_store: buck2_env!("BUCK2_LOCAL_CONTENT_STORE")?.map(str::to_owned),
+            local_content_store_max_bytes: buck2_env!("BUCK2_LOCAL_CONTENT_STORE_MAX_BYTES")?
+                .map(str::to_owned),
+            local_content_store_max_entries: buck2_env!("BUCK2_LOCAL_CONTENT_STORE_MAX_ENTRIES")?
+                .map(str::to_owned),
+            extra_external_config: buck2_env!("BUCK2_EXTRA_EXTERNAL_CONFIG")?.map(str::to_owned),
+            local_cas_dir: buck2_env!("BUCK2_LOCAL_CAS_DIR")?.map(str::to_owned),
+            local_cas_journal: buck2_env!("BUCK2_LOCAL_CAS_JOURNAL")?.map(str::to_owned),
             num_tokio_workers: config
                 .parse(BuckconfigKeyRef {
                     section: "build",
@@ -792,6 +860,13 @@ impl DaemonStartupConfig {
     pub fn testing_empty() -> Self {
         Self {
             buck_settings: BuckSettings::empty(),
+            remote_execution_config_digest: String::new(),
+            local_content_store: None,
+            local_content_store_max_bytes: None,
+            local_content_store_max_entries: None,
+            extra_external_config: None,
+            local_cas_dir: None,
+            local_cas_journal: None,
             num_tokio_workers: None,
             daemon_buster: None,
             digest_algorithms: None,
@@ -824,9 +899,192 @@ mod tests {
     use crate::settings::parser::table;
 
     #[test]
+    fn test_unreadable_remote_execution_inputs_do_not_fail_startup() -> buck2_error::Result<()> {
+        let digest = |data: &str| -> buck2_error::Result<String> {
+            remote_execution_config_digest(&parse(&[("config", data)], "config")?, Path::new("/"))
+        };
+        let missing = digest("[buck2_re_client]\ntls_ca_certs = /nonexistent/sekka-a.pem\n")?;
+        assert_ne!(missing, digest("[buck2_re_client]\ntls_ca_certs = /nonexistent/sekka-b.pem\n")?);
+        let unset = digest("[buck2_re_client]\nhttp_headers = x-key:$BUCK2_TEST_UNSET_VARIABLE\n")?;
+        assert_ne!(unset, digest("[buck2_re_client]\nhttp_headers = x-key:\n")?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_extra_external_config_tracks_daemon_identity() -> buck2_error::Result<()> {
+        const CHILD_ENV: &str = "BUCK2_TEST_EXTRA_EXTERNAL_CONFIG_IDENTITY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let config = parse(&[("config", "")], "config")?;
+            let startup =
+                DaemonStartupConfig::new(&config, &BuckSettings::empty(), false, Path::new("."))?;
+            println!("\nSTARTUP_IDENTITY={}", startup.serialize()?);
+            return Ok(());
+        }
+        let capture = |layer: Option<&str>| {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "init::tests::test_extra_external_config_tracks_daemon_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env_remove("BUCK2_EXTRA_EXTERNAL_CONFIG");
+            if let Some(layer) = layer {
+                command.env("BUCK2_EXTRA_EXTERNAL_CONFIG", layer);
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout)?;
+            DaemonStartupConfig::deserialize(
+                stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("STARTUP_IDENTITY="))
+                    .expect("child startup identity"),
+            )
+        };
+        let unset = capture(None)?;
+        let layer = capture(Some("/tmp/sekka-layer-a.buckconfig"))?;
+        assert_eq!(
+            layer.extra_external_config.as_deref(),
+            Some("/tmp/sekka-layer-a.buckconfig")
+        );
+        assert_ne!(unset, layer);
+        assert_eq!(layer, capture(Some("/tmp/sekka-layer-a.buckconfig"))?);
+        assert_ne!(layer, capture(Some("/tmp/sekka-layer-b.buckconfig"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_local_content_store_environment_tracks_daemon_identity() -> buck2_error::Result<()> {
+        const CHILD_ENV: &str = "BUCK2_TEST_LOCAL_CONTENT_STORE_IDENTITY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let config = parse(&[("config", "")], "config")?;
+            let startup =
+                DaemonStartupConfig::new(&config, &BuckSettings::empty(), false, Path::new("."))?;
+            println!("\nSTARTUP_IDENTITY={}", startup.serialize()?);
+            return Ok(());
+        }
+
+        // Each process reads its real startup environment without racing other tests
+        // or relying on mutation of the cached buck2_env! values.
+        let capture = |path: Option<&str>, bytes: Option<&str>, entries: Option<&str>| {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "init::tests::test_local_content_store_environment_tracks_daemon_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1");
+            for (key, value) in [
+                ("BUCK2_LOCAL_CONTENT_STORE", path),
+                ("BUCK2_LOCAL_CONTENT_STORE_MAX_BYTES", bytes),
+                ("BUCK2_LOCAL_CONTENT_STORE_MAX_ENTRIES", entries),
+            ] {
+                command.env_remove(key);
+                if let Some(value) = value {
+                    command.env(key, value);
+                }
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout)?;
+            DaemonStartupConfig::deserialize(
+                stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("STARTUP_IDENTITY="))
+                    .expect("child startup identity"),
+            )
+        };
+        let disabled = capture(None, None, None)?;
+        let original = capture(Some("/tmp/store-a"), Some("1024"), Some("64"))?;
+        assert_eq!(
+            original.local_content_store.as_deref(),
+            Some("/tmp/store-a")
+        );
+        assert_eq!(
+            original.local_content_store_max_bytes.as_deref(),
+            Some("1024")
+        );
+        assert_eq!(
+            original.local_content_store_max_entries.as_deref(),
+            Some("64")
+        );
+        assert_ne!(disabled, original);
+        assert_eq!(
+            original,
+            capture(Some("/tmp/store-a"), Some("1024"), Some("64"))?
+        );
+        assert_ne!(
+            original,
+            capture(Some("/tmp/store-b"), Some("1024"), Some("64"))?
+        );
+        assert_ne!(
+            original,
+            capture(Some("/tmp/store-a"), Some("2048"), Some("64"))?
+        );
+        assert_ne!(
+            original,
+            capture(Some("/tmp/store-a"), Some("1024"), Some("128"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_config_digest_tracks_effective_values_without_secrets() -> buck2_error::Result<()>
+    {
+        let a = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nhttp_headers = authorization: Bearer secret-a\n",
+            )],
+            "config",
+        )?;
+        let equivalent = parse(
+            &[(
+                "config",
+                "# different formatting\n[buck2_re_client]\n  http_headers=authorization: Bearer secret-a\n",
+            )],
+            "config",
+        )?;
+        let changed = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nhttp_headers = authorization: Bearer secret-b\n",
+            )],
+            "config",
+        )?;
+        let a = DaemonStartupConfig::new(&a, &BuckSettings::empty(), false, Path::new("."))?;
+        let equivalent =
+            DaemonStartupConfig::new(&equivalent, &BuckSettings::empty(), false, Path::new("."))?;
+        let changed =
+            DaemonStartupConfig::new(&changed, &BuckSettings::empty(), false, Path::new("."))?;
+        assert_eq!(
+            a.remote_execution_config_digest,
+            equivalent.remote_execution_config_digest
+        );
+        assert_ne!(
+            a.remote_execution_config_digest,
+            changed.remote_execution_config_digest
+        );
+        assert!(!a.serialize()?.contains("secret-a"));
+        Ok(())
+    }
+
+    #[test]
     fn test_daemon_idle_timeout_s_default() -> buck2_error::Result<()> {
         let config = parse(&[("config", indoc!(r#""#))], "config")?;
-        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
+        let startup_config =
+            DaemonStartupConfig::new(&config, &BuckSettings::empty(), false, Path::new("."))?;
         assert_eq!(startup_config.daemon_idle_timeout_s, None);
         Ok(())
     }
@@ -845,7 +1103,8 @@ mod tests {
             )],
             "config",
         )?;
-        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
+        let startup_config =
+            DaemonStartupConfig::new(&config, &BuckSettings::empty(), false, Path::new("."))?;
         assert_eq!(startup_config.daemon_idle_timeout_s, Some(10800));
         Ok(())
     }
@@ -855,7 +1114,7 @@ mod tests {
         let config = parse(&[("config", "")], "config")?;
         let settings = resolve_setting_flags(vec![table("[hydration]\npage_out_on_idle = true")])?;
 
-        let startup_config = DaemonStartupConfig::new(&config, &settings, false)?;
+        let startup_config = DaemonStartupConfig::new(&config, &settings, false, Path::new("."))?;
         let hydration = startup_config
             .idle_page_out_config_for_isolation_dir(
                 FileName::new("v2").expect("The default isolation dir should be valid"),
@@ -880,7 +1139,8 @@ mod tests {
             "config",
         )?;
 
-        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
+        let startup_config =
+            DaemonStartupConfig::new(&config, &BuckSettings::empty(), false, Path::new("."))?;
         let hydration = startup_config
             .hydration
             .expect("Legacy idle page-out config should enable hydration");
@@ -907,7 +1167,7 @@ mod tests {
             "[hydration]\nenable_paging = true\npage_out_on_idle = false",
         )])?;
 
-        let startup_config = DaemonStartupConfig::new(&config, &settings, false)?;
+        let startup_config = DaemonStartupConfig::new(&config, &settings, false, Path::new("."))?;
         let hydration = startup_config
             .hydration
             .expect("Explicit Buck settings should keep hydration enabled");
@@ -934,7 +1194,7 @@ mod tests {
             "[hydration]\nenable_paging = false\npage_out_on_idle = false",
         )])?;
 
-        let startup_config = DaemonStartupConfig::new(&config, &settings, false)?;
+        let startup_config = DaemonStartupConfig::new(&config, &settings, false, Path::new("."))?;
         assert_eq!(startup_config.hydration, None);
         Ok(())
     }
@@ -956,7 +1216,7 @@ mod tests {
         let settings = resolve_setting_flags(vec![table(
             "[hydration]\npage_out_on_idle_isolation_dir_scope = \"non_default\"",
         )])?;
-        let startup_config = DaemonStartupConfig::new(&config, &settings, false)?;
+        let startup_config = DaemonStartupConfig::new(&config, &settings, false, Path::new("."))?;
 
         assert!(
             startup_config.hydration.is_some(),

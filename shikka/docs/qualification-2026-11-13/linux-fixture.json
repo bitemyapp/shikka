@@ -1,0 +1,130 @@
+{
+  "light": false,
+  "reference": "42:hello\n",
+  "observations": [
+    {
+      "command": [
+        "cargo",
+        "generate-lockfile",
+        "--offline"
+      ],
+      "seconds": 0.04999732298892923,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "run",
+        "--offline",
+        "-q"
+      ],
+      "seconds": 0.2777516219939571,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--workspace"
+      ],
+      "seconds": 0.21801378298550844,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "--offline",
+        "init"
+      ],
+      "seconds": 0.3919946360110771,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "--bin",
+        "shikka-fixture",
+        "run"
+      ],
+      "seconds": 0.9796792179986369,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "test"
+      ],
+      "seconds": 1.1865032049827278,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "check"
+      ],
+      "seconds": 0.06522239401238039,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "build"
+      ],
+      "seconds": 0.3066588109941222,
+      "returncode": 3
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "--bin",
+        "shikka-fixture",
+        "run"
+      ],
+      "seconds": 0.4151024419988971,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "test"
+      ],
+      "seconds": 0.5253234209958464,
+      "returncode": 32
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "test"
+      ],
+      "seconds": 0.5210908660083078,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3",
+        "-m",
+        "shikka",
+        "build"
+      ],
+      "seconds": 0.05524431698722765,
+      "returncode": 1
+    }
+  ]
+}

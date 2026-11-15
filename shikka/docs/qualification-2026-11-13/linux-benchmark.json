@@ -1,0 +1,410 @@
+{
+  "repository_commit": "178cc027e283fd965cb72d0a7395b219eada170c",
+  "runs": [
+    {
+      "name": "cold",
+      "seconds": 14.51263985701371,
+      "actions": {
+        "total": 54,
+        "cached": 0,
+        "remote": 0,
+        "local": 54
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "content_dirs": [
+            "/home/callen/.cache/shikka/benchmark-final/cas/content"
+          ],
+          "content_stores": [
+            "/home/callen/.cache/shikka/benchmark-final/content-store"
+          ],
+          "candidates": 0,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 0,
+          "cross_filesystem": false,
+          "differs": [],
+          "errors": [],
+          "seconds": 0.004
+        },
+        {
+          "schema": 1,
+          "entries": 1333,
+          "already_shared": 0,
+          "deduplicated": 1017,
+          "deduplicated_bytes": 401330280,
+          "skipped_small": 315,
+          "missing_blob": 1,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.105
+        }
+      ]
+    },
+    {
+      "name": "unchanged-0",
+      "seconds": 0.13856158702401444,
+      "actions": {
+        "total": 0,
+        "cached": 0,
+        "remote": 0,
+        "local": 0
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 0,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 0,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.0
+        }
+      ]
+    },
+    {
+      "name": "unchanged-1",
+      "seconds": 0.12970443299855106,
+      "actions": {
+        "total": 0,
+        "cached": 0,
+        "remote": 0,
+        "local": 0
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 0,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 0,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.001
+        }
+      ]
+    },
+    {
+      "name": "unchanged-2",
+      "seconds": 0.12321146600879729,
+      "actions": {
+        "total": 0,
+        "cached": 0,
+        "remote": 0,
+        "local": 0
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 0,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 0,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.0
+        }
+      ]
+    },
+    {
+      "name": "small-0",
+      "seconds": 2.2374960990273394,
+      "actions": {
+        "total": 2,
+        "cached": 0,
+        "remote": 0,
+        "local": 2
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 529,
+          "already_shared": 515,
+          "deduplicated": 5,
+          "deduplicated_bytes": 74072784,
+          "skipped_small": 9,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.044
+        }
+      ]
+    },
+    {
+      "name": "small-1",
+      "seconds": 2.1736254379793536,
+      "actions": {
+        "total": 2,
+        "cached": 0,
+        "remote": 0,
+        "local": 2
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 529,
+          "already_shared": 515,
+          "deduplicated": 5,
+          "deduplicated_bytes": 74071354,
+          "skipped_small": 9,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.034
+        }
+      ]
+    },
+    {
+      "name": "small-2",
+      "seconds": 2.1996654650138225,
+      "actions": {
+        "total": 2,
+        "cached": 0,
+        "remote": 0,
+        "local": 2
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 529,
+          "already_shared": 515,
+          "deduplicated": 5,
+          "deduplicated_bytes": 74071357,
+          "skipped_small": 9,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.046
+        }
+      ]
+    },
+    {
+      "name": "small-restore",
+      "seconds": 0.8971826040069573,
+      "actions": {
+        "total": 2,
+        "cached": 2,
+        "remote": 0,
+        "local": 0
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 0,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 0,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.001
+        }
+      ]
+    },
+    {
+      "name": "deep-0",
+      "seconds": 5.100003673986066,
+      "actions": {
+        "total": 6,
+        "cached": 0,
+        "remote": 0,
+        "local": 6
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "content_dirs": [
+            "/home/callen/.cache/shikka/benchmark-final/cas/content"
+          ],
+          "content_stores": [
+            "/home/callen/.cache/shikka/benchmark-final/content-store"
+          ],
+          "candidates": 0,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 0,
+          "cross_filesystem": false,
+          "differs": [],
+          "errors": [],
+          "seconds": 0.004
+        },
+        {
+          "schema": 1,
+          "entries": 1022,
+          "already_shared": 926,
+          "deduplicated": 31,
+          "deduplicated_bytes": 99250127,
+          "skipped_small": 65,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.065
+        }
+      ]
+    },
+    {
+      "name": "deep-1",
+      "seconds": 4.867300714977318,
+      "actions": {
+        "total": 6,
+        "cached": 0,
+        "remote": 0,
+        "local": 6
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 1022,
+          "already_shared": 926,
+          "deduplicated": 31,
+          "deduplicated_bytes": 99255316,
+          "skipped_small": 65,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.05
+        }
+      ]
+    },
+    {
+      "name": "deep-2",
+      "seconds": 4.753484018001473,
+      "actions": {
+        "total": 6,
+        "cached": 0,
+        "remote": 0,
+        "local": 6
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 1022,
+          "already_shared": 926,
+          "deduplicated": 31,
+          "deduplicated_bytes": 99255309,
+          "skipped_small": 65,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.05
+        }
+      ]
+    },
+    {
+      "name": "deep-restore",
+      "seconds": 1.7588767360139173,
+      "actions": {
+        "total": 6,
+        "cached": 6,
+        "remote": 0,
+        "local": 0
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 0,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 0,
+          "missing_blob": 0,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.001
+        }
+      ]
+    },
+    {
+      "name": "fresh-checkout",
+      "seconds": 1.7957391509844456,
+      "actions": {
+        "total": 54,
+        "cached": 54,
+        "remote": 0,
+        "local": 0
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 3,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 2,
+          "missing_blob": 1,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.005
+        }
+      ]
+    },
+    {
+      "name": "cache-restart",
+      "seconds": 2.5079322819947265,
+      "actions": {
+        "total": 54,
+        "cached": 54,
+        "remote": 0,
+        "local": 0
+      },
+      "sharing": [
+        {
+          "schema": 1,
+          "entries": 3,
+          "already_shared": 0,
+          "deduplicated": 0,
+          "deduplicated_bytes": 0,
+          "skipped_small": 2,
+          "missing_blob": 1,
+          "changed": 0,
+          "cross_filesystem": false,
+          "errors": [],
+          "seconds": 0.004
+        }
+      ]
+    }
+  ],
+  "medians_seconds": {
+    "unchanged": 0.12970443299855106,
+    "small": 2.1996654650138225,
+    "deep": 4.867300714977318
+  },
+  "storage": {
+    "files": 3224,
+    "logical_bytes": 1525910422,
+    "stat_allocated_sum_bytes": 1533788160,
+    "fiemap_mapped_sum_bytes": 460128256,
+    "fiemap_unique_bytes": 420806656,
+    "fiemap_shared_bytes": 39321600,
+    "excluded_mapping_bytes": 1073659904
+  },
+  "loadavg": [
+    4.91162109375,
+    18.78076171875,
+    22.802734375
+  ]
+}

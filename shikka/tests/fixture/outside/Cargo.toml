@@ -1,0 +1,8 @@
+# A path dependency outside the Cargo workspace, and a Rust dylib: Cargo links
+# std into it dynamically because it is built only as a dependency.
+[package]
+name = "outside"
+version = "0.1.0"
+edition = "2024"
+[lib]
+crate-type = ["dylib"]

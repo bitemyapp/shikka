@@ -45,7 +45,9 @@ pub enum NegativeCache {
     /// miss, which then merely do redundant work.
     Allowed,
     /// A strongly consistent read decides before a miss is reported. Required when a miss is an
-    /// error, or is recorded as the blob's expiration.
+    /// error, or is recorded as the blob's expiration. The CAS also decides every hit: an
+    /// expiration the digest remembers is not a lease when the CAS evicts by LRU, and a cache
+    /// upload that trusts one writes an action result naming a blob that is already gone.
     Bypassed,
 }
 
@@ -169,8 +171,9 @@ impl CasPresence {
     }
 
     /// One answer per digest, in order. A digest that already knows an expiration beyond
-    /// [`HEADROOM`] is answered from that; every other one is asked about, and what the CAS says
-    /// is stamped onto the digest, which is the interned entry every holder of that blob shares.
+    /// [`HEADROOM`] is answered from that unless the check bypasses caches; every other one is
+    /// asked about, and what the CAS says is stamped onto the digest, which is the interned
+    /// entry every holder of that blob shares.
     ///
     /// Requests for the same blob share one RPC, RPCs carry at most `MAX_BATCH` digests, and
     /// only as many run at once as the client is configured for; when they are all busy, new
@@ -197,7 +200,7 @@ impl CasPresence {
         let mut asked_at = Vec::new();
         for (i, digest) in digests.into_iter().enumerate() {
             let expires = digest.expires()?;
-            if expires > deadline {
+            if expires > deadline && negative_cache == NegativeCache::Allowed {
                 answers[i] = Some(Some(expires));
             } else {
                 asked.push(digest);
@@ -703,6 +706,31 @@ mod tests {
         assert!(answers[1].is_some());
         assert_eq!(stub.calls(), vec![vec![stale.to_re()]]);
         assert_eq!(presence.stats().digest_answers, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bypassed_checks_ask_despite_a_known_expiration() -> buck2_error::Result<()> {
+        let presence = Arc::new(CasPresence::new(1));
+        // The CAS evicted the blob after the digest learned a far expiration.
+        let stub = Stub::new(|_| -1);
+        let evicted = TrackedFileDigest::new_expires(
+            digest("evicted").data().dupe(),
+            Timestamp::now() + HEADROOM + SignedDuration::from_mins(60),
+            config(),
+        );
+
+        let answers = check_as(
+            &presence,
+            &stub,
+            use_case(),
+            NegativeCache::Bypassed,
+            vec![evicted.dupe()],
+        )
+        .await?;
+        assert_eq!(answers, vec![None]);
+        assert_eq!(stub.calls(), vec![vec![evicted.to_re()]]);
+        assert_eq!(presence.stats().digest_answers, 0);
         Ok(())
     }
 

@@ -1,0 +1,10 @@
+[workspace]
+members = ["helper", "macros"]
+resolver = "3"
+[package]
+name = "shikka-fixture"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+helper = { path = "helper", features = ["answer"] }
+fixture-macro = { path = "macros" }
