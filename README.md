@@ -1,3 +1,5 @@
+<img src="shikka/docs/shikka.svg" width="112" height="112" alt="Shikka's icon: a young buck peeking out of a wooden cargo crate">
+
 # Shikka
 
 Cargo projects, built by Buck2, with an optional shared NativeLink cache.
