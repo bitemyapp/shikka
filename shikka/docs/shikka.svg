@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shikka's icon: a young buck (shika, deer) peeking out of a cargo crate.
+
+  Hand-written, so edit it by hand. Everything is drawn on a 256 x 256 grid and
+  is symmetric about x = 128: each right-hand shape is its left-hand twin with
+  x replaced by 256 - x. Only the eye highlights sit on the same side.
+
+  Palette
+    #2d6a4f  tile                  #e3a05c  coat
+    #fff1d6  antlers, muzzle, ears #3a2618  eyes, nose, hooves
+    #ee8f6b  cheeks                #f2cf93  crate boards
+    #c08a4e  crate rim, seams, nails
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="shikka-title shikka-desc">
+  <title id="shikka-title">Shikka</title>
+  <desc id="shikka-desc">A young buck with small forked antlers peeking over the rim of a wooden cargo crate, both front hooves resting on the edge.</desc>
+
+  <!-- Tile: the icon carries its own background, so it reads on light and dark pages. -->
+  <rect width="256" height="256" rx="56" fill="#2d6a4f"/>
+
+  <!-- Antlers: a main beam and one inner tine each. -->
+  <g fill="none" stroke="#fff1d6" stroke-width="13" stroke-linecap="round">
+    <path d="M104 78 C100 58 84 48 78 22 M93 53 C102 48 108 41 109 32"/>
+    <path d="M152 78 C156 58 172 48 178 22 M163 53 C154 48 148 41 147 32"/>
+  </g>
+
+  <!-- Ears, then their linings. -->
+  <g fill="#e3a05c">
+    <path d="M80 130 C52 134 26 116 18 88 C46 78 76 86 92 106 Z"/>
+    <path d="M176 130 C204 134 230 116 238 88 C210 78 180 86 164 106 Z"/>
+  </g>
+  <g fill="#fff1d6">
+    <path d="M74 119 C56 119 40 109 32 95 C50 91 68 97 80 109 Z"/>
+    <path d="M182 119 C200 119 216 109 224 95 C206 91 188 97 176 109 Z"/>
+  </g>
+
+  <!-- Head. Its lower edge is hidden behind the crate. -->
+  <path fill="#e3a05c" d="M128 68 C166 68 192 92 192 120 C192 142 178 156 164 166 V182 H92 V166 C78 156 64 142 64 120 C64 92 90 68 128 68 Z"/>
+  <ellipse cx="128" cy="156" rx="28" ry="22" fill="#fff1d6"/>
+  <g fill="#ee8f6b">
+    <ellipse cx="82" cy="145" rx="8" ry="5.5"/>
+    <ellipse cx="174" cy="145" rx="8" ry="5.5"/>
+  </g>
+  <g fill="#3a2618">
+    <ellipse cx="128" cy="145" rx="10" ry="7"/>
+    <circle cx="99" cy="124" r="10.5"/>
+    <circle cx="157" cy="124" r="10.5"/>
+  </g>
+  <g fill="#fff1d6">
+    <circle cx="102" cy="120" r="3.5"/>
+    <circle cx="160" cy="120" r="3.5"/>
+  </g>
+
+  <!-- Crate: boards, seams between them, the rim, and four nails. -->
+  <rect x="40" y="168" width="176" height="70" rx="6" fill="#f2cf93"/>
+  <g fill="none" stroke="#c08a4e" stroke-width="4">
+    <path d="M58 195 H198 M58 217 H198"/>
+    <path d="M58 172 V238 M198 172 V238"/>
+  </g>
+  <g fill="#c08a4e">
+    <rect x="40" y="166" width="176" height="8" rx="4"/>
+    <circle cx="49" cy="186" r="3"/>
+    <circle cx="49" cy="226" r="3"/>
+    <circle cx="207" cy="186" r="3"/>
+    <circle cx="207" cy="226" r="3"/>
+  </g>
+
+  <!-- Hooves resting on the rim, each split by a short notch. -->
+  <g fill="#3a2618">
+    <rect x="65" y="154" width="22" height="22" rx="8"/>
+    <rect x="169" y="154" width="22" height="22" rx="8"/>
+  </g>
+  <path d="M76 165 V176 M180 165 V176" stroke="#f2cf93" stroke-width="3"/>
+</svg>
