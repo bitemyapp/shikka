@@ -331,7 +331,9 @@ fn capture(
             .collect::<buck2_error::Result<Vec<_>>>()?;
         // Only private paths are passed here: ingestion may replace them, but
         // cannot replace a compiler inode while an open writer still owns it.
-        local_content_store::ingest_files(&paths, config)?;
+        // Each was hashed just above, from this private file, so the store
+        // does not hash its clone of it again.
+        local_content_store::ingest_snapshots(&paths, config)?;
     }
     let mut uploads = Vec::with_capacity(if want_upload { files.len() } else { 0 });
     let mut prepared = Vec::with_capacity(if local_content_store::ingests_outputs() {
@@ -349,10 +351,9 @@ fn capture(
             };
             if source.metadata()?.mode() & 0o7777 != mode {
                 // A newly admitted object retains the original 0600 private
-                // file; normalize and sync that view. Reused store views have
-                // already been normalized and synced before ingestion returns.
+                // file; normalize that view. Reused store views have already
+                // been normalized before ingestion returns.
                 source.set_permissions(Permissions::from_mode(mode))?;
-                source.sync_all()?;
             }
             if want_upload {
                 let mut staged = tempfile::Builder::new()

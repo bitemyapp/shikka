@@ -13,19 +13,37 @@
 //! A process-shared lock protects the SQLite LRU and object namespace. The
 //! database is an eviction index, not an authority for content correctness.
 //!
+//! Durability is lazy. An action is told its outputs are published before
+//! anything of theirs has been synced. The commit that accounts for a new
+//! object also marks it pending, and a settle pass, off the action's path,
+//! syncs pending objects, then the store directory once, then clears their
+//! marks in one synced commit. So an object without a mark is durable, and one
+//! with a mark from this boot is intact and only waiting. `reconcile` drops an
+//! object whose mark is from another boot: after power loss it is a miss, to be
+//! built or admitted again, and never an object that fails its hash when used.
+//! Removal is not lazy. An eviction, or the row of an object found missing, is
+//! directory-synced and then committed durably before any name is created, so
+//! a key cannot be read as durable on the strength of a file it used to name.
+//! Views in a worktree are never synced: they are as durable as what the
+//! compiler wrote beside them, which is all the engine's own record of its
+//! outputs assumes.
+//!
 //! Artifact ingestion holds both locks for a bounded metadata quantum: at most
 //! 256 destinations or 256 MiB charged as two snapshots per destination. Each
 //! staging group contains at most 16 destinations and targets 64 MiB of staged
 //! logical bytes. A file larger than either budget runs alone at that level,
-//! provided it fits the cache. At most 32 stage/source descriptors are retained.
-//! All COW snapshots are verified before the per-file sync pass. FULL SQLite
-//! accounting commits precede canonical renames, and namespace removals are
-//! directory-synced before deletion accounting commits. Publication directory
-//! syncs are shared within staging groups; cached-only groups share metadata
-//! commits until the quantum ends. Transactions finish before either unlock.
-//! Before admission, each group clears a fixed staging namespace under both
-//! locks, including leftovers from a dead peer whose survivors remain open.
-//! Staging stays directly beside canonical objects, not across a subvolume.
+//! provided it fits the cache. At most 32 stage/source descriptors are
+//! retained, and a settle pass holds 8 more. All COW snapshots are verified
+//! before accounting, with one exception: a new object cloned from a private
+//! snapshot that its caller, the output pipeline, has just hashed is admitted
+//! on that hash and its size. Nothing is served on it: a view of any object is
+//! hashed when published. Accounting commits precede canonical renames, so a
+//! process that dies leaves its live peers accounted misses, never unaccounted
+//! objects. Cached-only groups share metadata commits until the quantum ends.
+//! Transactions finish before either unlock. Before admission, each group
+//! clears a fixed staging namespace under both locks, including leftovers from
+//! a dead peer whose survivors remain open. Staging stays directly beside
+//! canonical objects, not across a subvolume.
 
 const INGEST_BATCH_FILES: usize = 16;
 const INGEST_METADATA_FILES: usize = 256;
@@ -68,6 +86,13 @@ mod linux {
     use crate::materializers::prepared_outputs;
     use crate::materializers::prepared_outputs::PreparedFile;
 
+    /// Objects a settle pass holds open at once, and syncs in parallel.
+    const SETTLE_FILES: usize = 8;
+    /// Objects a settle pass makes durable before its one directory sync and
+    /// its one synced commit.
+    const SETTLE_PASS: usize = 256;
+    /// How long the first unsettled object waits for others to join its pass.
+    const SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
     const INGEST_BATCH_BYTES: u64 = 64 * 1024 * 1024;
     const INGEST_METADATA_BYTES: u64 = 256 * 1024 * 1024;
     const INDEX_FILES: [&str; 4] = [
@@ -86,6 +111,19 @@ mod linux {
             .num_threads(super::INGEST_BATCH_FILES)
             .spawn_handler(|thread| {
                 buck2_util::threads::thread_spawn("buck2-cow-io", move || thread.run())
+                    .map(|_| ())
+            })
+            .build()
+            .map_err(|error| error.to_string())
+    });
+
+    // Settling syncs objects that actions have already been told are published.
+    // It has its own workers so that it never delays the staging pool above.
+    static SETTLE_IO: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(SETTLE_FILES)
+            .spawn_handler(|thread| {
+                buck2_util::threads::thread_spawn("buck2-cow-settle", move || thread.run())
                     .map(|_| ())
             })
             .build()
@@ -170,6 +208,19 @@ mod linux {
         }
     }
 
+    /// What a caller asks of `access_group`, and what it vouches for.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Admission {
+        /// Publish views of objects the store already has. Admit nothing.
+        Lookup,
+        /// Admit files that were hashed elsewhere, such as worktree outputs:
+        /// the store hashes its own snapshot of each before keeping it.
+        Verify,
+        /// Admit private snapshots the caller has itself just hashed, which
+        /// nothing else writes. The store checks only their size.
+        Hashed,
+    }
+
     struct IngestRequest<'a> {
         destination: &'a Path,
         executable: bool,
@@ -199,19 +250,12 @@ mod linux {
 
     enum PublicationFile {
         Staged(NamedTempFile),
-        // Hashed, normalized and synced while its producer was still running.
+        // Hashed and normalized while its producer was still running.
         // Its independent upload snapshot does not move with this publication.
         Prepared(PreparedFile),
     }
 
     impl PublicationFile {
-        fn needs_sync(&self) -> Option<&NamedTempFile> {
-            match self {
-                Self::Staged(file) => Some(file),
-                Self::Prepared(_) => None,
-            }
-        }
-
         fn persist(self, destination: &Path) -> buck2_error::Result<()> {
             match self {
                 Self::Staged(file) => {
@@ -262,6 +306,25 @@ mod linux {
         // bound instead of each costing a synchronous commit under the locks.
         advisory: std::cell::RefCell<Vec<Advisory>>,
         advisory_since: std::cell::Cell<Option<std::time::Instant>>,
+        // This kernel's boot, if it can be told. A pending object from the same
+        // boot is intact, synced or not; one from another boot may not be.
+        boot: Option<String>,
+        // Objects this process admitted, or found pending at open, that it has
+        // not yet made durable: key and the serial of that admission.
+        unsettled: std::cell::RefCell<std::collections::VecDeque<(String, i64)>>,
+    }
+
+    /// One object of a settle pass: `file` is absent if the object is gone.
+    struct Unsettled {
+        key: String,
+        serial: i64,
+        file: Option<File>,
+    }
+
+    fn boot_id() -> Option<String> {
+        let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_owned())
     }
 
     enum Advisory {
@@ -336,10 +399,13 @@ mod linux {
             if !wal {
                 return Err(error("Local content store requires SQLite WAL journaling"));
             }
-            // Keep FULL durability without creating/removing a rollback journal
-            // on every bounded metadata commit. The size limit trims retained
-            // WAL space after reset; it is not a peak transaction-size bound.
-            db.execute_batch("PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=256;
+            // Commits are not synced: the WAL keeps the index consistent after
+            // power loss at whatever prefix of them reached the disk, and
+            // sync_index makes that prefix include the commits that must not
+            // be lost. Settling checkpoints; the automatic one is a backstop.
+            // The size limit trims retained WAL space after reset; it is not a
+            // peak transaction-size bound.
+            db.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=4096;
                 PRAGMA journal_size_limit=4194304; PRAGMA auto_vacuum=FULL;
                 CREATE TABLE IF NOT EXISTS objects (key TEXT PRIMARY KEY, size INTEGER NOT NULL, used INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS lru ON objects(used);
@@ -358,6 +424,12 @@ mod linux {
                 INSERT OR IGNORE INTO view_totals SELECT 1,COUNT(*) FROM views;
                 CREATE TRIGGER IF NOT EXISTS view_added AFTER INSERT ON views BEGIN UPDATE view_totals SET entries=entries+1 WHERE id=1; END;
                 CREATE TRIGGER IF NOT EXISTS view_removed AFTER DELETE ON views BEGIN UPDATE view_totals SET entries=entries-1 WHERE id=1; END;")?;
+            // An object is pending from its admission until a settle pass has
+            // synced it. The serial tells one admission of a key from the next.
+            // An engine without this table syncs before it publishes, so an
+            // object with no row here is durable.
+            db.execute_batch("CREATE TABLE IF NOT EXISTS pending (key TEXT PRIMARY KEY, serial INTEGER NOT NULL, boot TEXT NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS object_no_longer_pending AFTER DELETE ON objects BEGIN DELETE FROM pending WHERE key=OLD.key; END;")?;
             let staging = std::array::from_fn(|slot| root.join(format!(".buck2-pending-{slot}")));
             let store = Self {
                 root,
@@ -368,6 +440,8 @@ mod linux {
                 max_entries,
                 advisory: Default::default(),
                 advisory_since: Default::default(),
+                boot: boot_id(),
+                unsettled: Default::default(),
             };
             store.reconcile()?;
             store.evict(0, 0)?;
@@ -379,12 +453,11 @@ mod linux {
         // Caller holds the shared lock. Fixed slots bound cleanup independently
         // of canonical object count and survive another process dying mid-group.
         fn clear_staging(&self) -> buck2_error::Result<()> {
+            // A leftover that reappears after power loss is an untracked name,
+            // which reconcile deletes; nothing here needs to be durable.
             for path in &self.staging {
                 remove(path)?;
             }
-            // Also cover a previous peer dying after unlink but before syncing,
-            // even when all slots are now observed absent.
-            File::open(&self.root)?.sync_all()?;
             Ok(())
         }
 
@@ -393,6 +466,15 @@ mod linux {
                 .prefix(self.staging[slot].file_name().expect("canonical staging filename"))
                 .rand_bytes(0)
                 .tempfile_in(&self.root)?)
+        }
+
+        /// Makes every commit so far durable. One synced commit carries the
+        /// log before it. Never call this inside a transaction.
+        fn sync_index(&self) -> buck2_error::Result<()> {
+            self.db.execute_batch(
+                "PRAGMA synchronous=FULL; UPDATE clock SET tick=tick+1 WHERE id=1; PRAGMA synchronous=NORMAL;",
+            )?;
+            Ok(())
         }
 
         fn key(digest: &FileDigest) -> String {
@@ -426,6 +508,21 @@ mod linux {
             // canonical objects are cache misses, not unaccounted live objects.
             // A failed group can roll back accounting after unlinking objects.
             // Make those observed absences durable before deleting index rows.
+            //
+            // An object still pending from another boot was never known to be
+            // durable: power may have been lost before its bytes were. Unlink
+            // it here, and the pass below drops its row like any missing one.
+            // One pending from this boot is intact and only waits to be synced.
+            {
+                let mut statement = self.db.prepare("SELECT key,boot FROM pending")?;
+                let rows = statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                for row in rows {
+                    let (key, boot) = row?;
+                    if self.boot.as_deref() != Some(boot.as_str()) {
+                        remove(&self.object_path(&key)?)?;
+                    }
+                }
+            }
             File::open(&self.root)?.sync_all()?;
             let mut statement = self.db.prepare("SELECT key FROM objects")?;
             let keys = statement.query_map([], |r| r.get::<_, String>(0))?;
@@ -456,19 +553,38 @@ mod linux {
                 }
             }
             File::open(&self.root)?.sync_all()?;
+            // A row whose object another engine removed, without the trigger.
+            self.db.execute("DELETE FROM pending WHERE key NOT IN (SELECT key FROM objects)", [])?;
+            // Every removal above is durable before any name can be reused.
+            self.sync_index()?;
+            // What is left pending is this boot's: a dead daemon's, or a live
+            // peer's, which will then be synced twice and marked once.
+            let mut statement = self.db.prepare("SELECT key,serial FROM pending ORDER BY serial")?;
+            let rows = statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut unsettled = self.unsettled.borrow_mut();
+            for row in rows {
+                unsettled.push_back(row?);
+            }
             Ok(())
         }
 
         fn evict(&self, extra_bytes: u64, extra_entries: u64) -> buck2_error::Result<()> {
             let transaction = self.db.unchecked_transaction()?;
-            if self.evict_in_transaction(extra_bytes, extra_entries, std::iter::empty())? {
+            let removed = self.evict_in_transaction(extra_bytes, extra_entries, std::iter::empty())?;
+            if removed {
                 File::open(&self.root)?.sync_all()?;
             }
             transaction.commit()?;
+            if removed {
+                self.sync_index()?;
+            }
             Ok(())
         }
 
-        // The caller must sync removed names before committing this transaction.
+        // The caller must sync removed names before committing this transaction,
+        // and sync the index after it, before any name is created: a removal
+        // is durable before its key can name another file. That is what lets
+        // "not pending" mean "these bytes were synced" across power loss.
         // Protect this group's sources: their bytes already count toward the
         // cap, and a new group never needs more distinct objects than can fit.
         fn evict_in_transaction<'a>(
@@ -625,17 +741,16 @@ mod linux {
             &self,
             files: impl Iterator<Item = (&'a Path, &'a FileDigest, bool)> + Clone,
             config: DigestConfig,
-            ingest: bool,
+            admission: Admission,
         ) -> buck2_error::Result<GroupResult> {
             let mut files = files.peekable();
             let mut transaction = None;
             let mut result = GroupResult {
                 consumed: 0, found: true, staging_bytes: 0, deferred: Vec::new(),
             };
-            let mut parents = HashSet::new();
             // No peer can create staging files while this quantum owns both
             // locks; completed groups remove all their own stages. Clearing
-            // waits for the first canonical stage, so lookups skip its sync.
+            // waits for the first canonical stage, so lookups skip it.
             let mut staging_cleared = false;
             while result.consumed < super::INGEST_METADATA_FILES {
                 let Some((_, digest, _)) = files.peek() else {
@@ -648,10 +763,9 @@ mod linux {
                 let group = self.stage_group(
                     files.clone().take(super::INGEST_METADATA_FILES - result.consumed),
                     config,
-                    ingest,
+                    admission,
                     remaining_bytes,
                     &mut transaction,
-                    &mut parents,
                     &mut staging_cleared,
                 )?;
                 files.nth(group.consumed - 1);
@@ -667,15 +781,7 @@ mod linux {
                     break;
                 }
             }
-            // Cached groups often publish into the same incremental-session
-            // directories. One barrier per parent per bounded quantum suffices;
-            // no successful result escapes before every rename is durable.
-            for parent in parents {
-                File::open(parent)?.sync_all()?;
-            }
             if let Some(transaction) = transaction {
-                // A cached quantum has written nothing unless the buffer is
-                // due, so its commit usually needs no synchronous write.
                 if self.advisory_due() {
                     self.flush_advisory()?;
                 }
@@ -688,15 +794,15 @@ mod linux {
             &'store self,
             files: impl Iterator<Item = (&'a Path, &'a FileDigest, bool)>,
             config: DigestConfig,
-            ingest: bool,
+            admission: Admission,
             byte_budget: u64,
             transaction: &mut Option<rusqlite::Transaction<'store>>,
-            parents: &mut HashSet<&'a Path>,
             staging_cleared: &mut bool,
         ) -> buck2_error::Result<GroupResult> {
             let capacity = files.size_hint().1
                 .unwrap_or(super::INGEST_BATCH_FILES)
                 .min(super::INGEST_BATCH_FILES);
+            let ingest = admission != Admission::Lookup;
             let mut requests = Vec::with_capacity(capacity);
             let mut objects: Vec<IngestObject<'a>> = Vec::with_capacity(capacity);
             let mut by_digest = HashMap::with_capacity(capacity);
@@ -802,6 +908,9 @@ mod linux {
                             File::open(&self.root)?.sync_all()?;
                         }
                         transaction.take().expect("active group transaction").commit()?;
+                        if removed_names {
+                            self.sync_index()?;
+                        }
                         return Ok(GroupResult {
                             consumed: requests.len(), found: false, staging_bytes: staged_bytes,
                             deferred: Vec::new(),
@@ -832,12 +941,35 @@ mod linux {
             }
             let prepare_canonical = |object: &mut IngestObject<'_>| -> buck2_error::Result<()> {
                 let staged = object.staged.as_mut().expect("canonical stage allocated");
-                match object.source.as_ref().expect("group source prepared") {
-                    IngestSource::Produced(file) => clone_file(file, staged.as_file())?,
-                    IngestSource::Recovered(file) => clone_file(file.as_file(), staged.as_file())?,
+                let hashed = match object.source.as_ref().expect("group source prepared") {
+                    IngestSource::Produced(file) => {
+                        clone_file(file, staged.as_file())?;
+                        admission == Admission::Hashed
+                    }
+                    // A weak hint names a worktree file, whoever asks.
+                    IngestSource::Recovered(file) => {
+                        clone_file(file.as_file(), staged.as_file())?;
+                        false
+                    }
                     IngestSource::Canonical(_) => unreachable!("new canonical object"),
+                };
+                if hashed {
+                    // The caller hashed this private file a moment ago, and its
+                    // own view of it is published on that hash alone. Reading
+                    // the same extents again under both locks would vouch for
+                    // nothing more. An object is never served on the strength
+                    // of this admission: every view of it is hashed when it is
+                    // published, as it would be after bit rot.
+                    let size = staged.as_file().metadata()?.len();
+                    if size != object.digest.size() {
+                        return Err(error(format!(
+                            "Local content store size mismatch: expected {}, got {size}",
+                            object.digest.size()
+                        )));
+                    }
+                } else {
+                    verify(staged.as_file_mut(), object.digest, config)?;
                 }
-                verify(staged.as_file_mut(), object.digest, config)?;
                 staged.as_file().set_permissions(Permissions::from_mode(0o444))?;
                 Ok(())
             };
@@ -925,37 +1057,28 @@ mod linux {
                 publications.push(publication?);
             }
 
-            // Every verified snapshot must be durable before accounting or
-            // publication. The dedicated pool joins all work, including on an
-            // error, before any stage can be removed or renamed.
-            {
-                let mut files = objects
-                    .iter()
-                    .filter_map(|object| object.staged.as_ref())
-                    .chain(publications.iter().filter_map(|publication| publication.file.needs_sync()));
-                if let Some(first) = files.next() {
-                    if files.next().is_none() {
-                        // Singleton downloads and files do not start a pool.
-                        first.as_file().sync_all()?;
-                    } else {
-                        FILE_IO.as_ref().map_err(error)?.install(|| {
-                            objects
-                                .par_iter()
-                                .filter_map(|object| object.staged.as_ref())
-                                .chain(publications.par_iter().filter_map(|publication| publication.file.needs_sync()))
-                                .try_for_each(|file| file.as_file().sync_all())
-                        })?;
-                    }
-                }
-            }
+            // Nothing is synced here. A new object is recorded as pending in the
+            // commit that accounts for it and is made durable by a settle pass,
+            // after the action that produced it has been told it is published.
+            // Views in a worktree are not synced at all: they are as durable as
+            // any file the compiler wrote, which is what the engine's own
+            // record of its outputs assumes.
             if removed_names {
                 File::open(&self.root)?.sync_all()?;
             }
+            let mut admitted = Vec::new();
             for object in objects.iter().filter(|object| object.new) {
                 self.db.execute(
                     "INSERT INTO objects VALUES(?1,?2,0)",
                     params![object.key, object.digest.size()],
                 )?;
+                self.db.prepare_cached("UPDATE clock SET tick=tick+1 WHERE id=1")?.execute([])?;
+                let serial: i64 = self.db.query_row("SELECT tick FROM clock WHERE id=1", [], |row| row.get(0))?;
+                self.db.execute(
+                    "INSERT OR REPLACE INTO pending VALUES(?1,?2,?3)",
+                    params![object.key, serial, self.boot.as_deref().unwrap_or("")],
+                )?;
+                admitted.push((object.key.clone(), serial));
             }
             // Weak paths are advisory and reverified on use; they may precede
             // publication. Recording accesses now lets subsequent groups see
@@ -964,45 +1087,45 @@ mod linux {
                 self.record_access(request.destination, &objects[request.object].key)?;
             }
             if new_entries != 0 || removed_names {
-                // Buffered accesses ride along with the durable commit.
+                // Buffered accesses ride along with the accounting commit.
                 self.flush_advisory()?;
-                // FULL accounting is durable BEFORE any canonical rename.
-                // Failure can leave accounted misses, never unaccounted objects.
+                // Accounting commits BEFORE any canonical rename. A process
+                // that dies here leaves accounted misses for its live peers,
+                // never unaccounted objects. The commit is not synced: after
+                // power loss a name without a row is deleted by reconcile.
                 transaction.take().expect("active group transaction").commit()?;
+                if removed_names {
+                    self.sync_index()?;
+                }
+                // Before the renames: a failed rename leaves a pending row for
+                // a missing object, which the settle pass then clears.
+                self.unsettled.borrow_mut().extend(admitted);
             }
             for object in &mut objects {
                 if let Some(staged) = object.staged.take() {
                     staged.persist(&object.path).map_err(|error| error.error)?;
                 }
             }
-            if new_entries != 0 {
-                File::open(&self.root)?.sync_all()?;
-            }
             for publication in publications {
-                let parent = publication.destination.parent()
-                    .ok_or_else(|| error("Missing output parent"))?;
                 publication.file.persist(publication.destination)?;
-                parents.insert(parent);
             }
             Ok(GroupResult {
                 consumed: requests.len(), found: true, staging_bytes: staged_bytes, deferred,
             })
         }
 
-        /// Clones, verifies and syncs every view `stage_group` deferred, then
-        /// renames them and makes the renames durable, without the store locks:
-        /// each reads only its own open object and writes beside its own
-        /// destination. Nothing is renamed unless every snapshot verified.
+        /// Clones and verifies every view `stage_group` deferred, then renames
+        /// them, without the store locks: each reads only its own open object
+        /// and writes beside its own destination. Nothing is renamed unless
+        /// every snapshot verified.
         fn publish_deferred(
             deferred: &[Deferred],
             config: DigestConfig,
         ) -> Result<(), PublishFailure> {
             let stage = |view: &Deferred| -> buck2_error::Result<NamedTempFile> {
-                let staged = Self::stage_publication(
+                Self::stage_publication(
                     &view.source, &view.destination, &view.digest, view.executable, config,
-                )?;
-                staged.as_file().sync_all()?;
-                Ok(staged)
+                )
             };
             let staged: Vec<_> = if deferred.len() > 1 {
                 let pool = FILE_IO.as_ref().map_err(|message| PublishFailure {
@@ -1020,13 +1143,8 @@ mod linux {
                 }
             }
             let failure = |error: std::io::Error| PublishFailure { view: None, error: error.into() };
-            let mut parents = HashSet::new();
             for (file, view) in files.into_iter().zip(deferred) {
                 file.persist(&view.destination).map_err(|error| failure(error.error))?;
-                parents.extend(view.destination.parent());
-            }
-            for parent in parents {
-                File::open(parent).and_then(|parent| parent.sync_all()).map_err(failure)?;
             }
             Ok(())
         }
@@ -1059,8 +1177,9 @@ mod linux {
             };
             if verify(&mut source, &view.digest, config).is_err() {
                 remove(&path)?;
-                self.db.execute("DELETE FROM objects WHERE key=?1", [&view.key])?;
                 File::open(&self.root)?.sync_all()?;
+                self.db.execute("DELETE FROM objects WHERE key=?1", [&view.key])?;
+                self.sync_index()?;
             }
             Ok(())
         }
@@ -1077,13 +1196,100 @@ mod linux {
             let group = self.access_group(
                 std::iter::once((destination, digest, executable)),
                 config,
-                ingest,
+                if ingest { Admission::Verify } else { Admission::Lookup },
             )?;
             if let Err(failure) = Self::publish_deferred(&group.deferred, config) {
                 self.after_failed_publication(&group.deferred, &failure, config)?;
                 return Err(failure.error);
             }
             Ok(group.found)
+        }
+
+        /// The next objects of a settle pass, opened under both locks so that
+        /// each descriptor is the admission its serial names.
+        fn settle_open(&self, limit: usize) -> buck2_error::Result<Vec<Unsettled>> {
+            let mut batch = Vec::new();
+            while batch.len() < limit {
+                let Some((key, serial)) = self.unsettled.borrow_mut().pop_front() else {
+                    break;
+                };
+                let pending: Option<i64> = self.db.prepare_cached("SELECT serial FROM pending WHERE key=?1")?
+                    .query_row([&key], |row| row.get(0)).optional()?;
+                if pending != Some(serial) {
+                    // Settled by a peer, evicted, or admitted again since.
+                    continue;
+                }
+                let path = self.root.join(&key);
+                let file = match open_file(&path) {
+                    Ok(file) => Some(file),
+                    // Its rename failed, or a peer without the trigger removed it.
+                    Err(_) if !path.try_exists()? => None,
+                    Err(error) => return Err(error),
+                };
+                batch.push(Unsettled { key, serial, file });
+            }
+            Ok(batch)
+        }
+
+        /// Syncs a batch's objects. Needs neither lock: it reads no name.
+        fn settle_sync(batch: &[Unsettled]) -> buck2_error::Result<()> {
+            let sync = |object: &Unsettled| match &object.file {
+                Some(file) => file.sync_all(),
+                None => Ok(()),
+            };
+            if batch.len() > 1 {
+                SETTLE_IO.as_ref().map_err(error)?.install(|| batch.par_iter().try_for_each(sync))?;
+            } else {
+                batch.iter().try_for_each(sync)?;
+            }
+            Ok(())
+        }
+
+        /// Ends a settle pass under both locks, after the caller has synced
+        /// every object in `settled` and then the store directory. Only the
+        /// admission that was synced is marked: a key evicted and admitted
+        /// again meanwhile has another serial and stays pending.
+        fn settle_mark(&self, settled: &[(String, i64)]) -> buck2_error::Result<()> {
+            let transaction = self.db.unchecked_transaction()?;
+            for (key, serial) in settled {
+                self.db.prepare_cached("DELETE FROM pending WHERE key=?1 AND serial=?2")?
+                    .execute(params![key, serial])?;
+            }
+            transaction.commit()?;
+            self.sync_index()?;
+            // Keep the log short from here, so that an action's own commit
+            // seldom has to. A busy reader only postpones it. The first write
+            // after a checkpoint restarts the log and syncs its header: make
+            // that write this one.
+            self.db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+            self.db.prepare_cached("UPDATE clock SET tick=tick+1 WHERE id=1")?.execute([])?;
+            Ok(())
+        }
+
+        /// What the settler does for the process's store, for one opened by a
+        /// test: every unsettled object, in one pass. Returns how many.
+        #[cfg(test)]
+        fn settle(&self) -> buck2_error::Result<usize> {
+            let mut settled = Vec::new();
+            loop {
+                self.lock.lock()?;
+                let batch = self.settle_open(SETTLE_FILES);
+                self.lock.unlock()?;
+                let batch = batch?;
+                if batch.is_empty() {
+                    break;
+                }
+                Self::settle_sync(&batch)?;
+                settled.extend(batch.into_iter().map(|object| (object.key, object.serial)));
+            }
+            if !settled.is_empty() {
+                File::open(&self.root)?.sync_all()?;
+                self.lock.lock()?;
+                let marked = self.settle_mark(&settled);
+                self.lock.unlock()?;
+                marked?;
+            }
+            Ok(settled.len())
         }
 
         fn note(&self, advisory: Advisory) {
@@ -1172,13 +1378,71 @@ mod linux {
             .map_err(|_| error("Local content store mutex poisoned"))?;
         store.lock.lock()?;
         let result = operation(&store);
+        let unsettled = !store.unsettled.borrow().is_empty();
         let unlock = store.lock.unlock();
+        drop(store);
+        if unsettled {
+            settle_soon();
+        }
         result
             .buck_error_context("Buck2 verified local content store")
             .and_then(|v| {
                 unlock?;
                 Ok(v)
             })
+    }
+
+    // One thread per process makes its unsettled objects durable, in passes,
+    // without an action waiting for it. A full channel already means "soon".
+    static SETTLER: LazyLock<Option<std::sync::mpsc::SyncSender<()>>> = LazyLock::new(|| {
+        let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
+        buck2_util::threads::thread_spawn("buck2-cow-settler", move || {
+            while woken.recv().is_ok() {
+                std::thread::sleep(SETTLE_DELAY);
+                // Whatever was admitted during the wait joins this pass.
+                let _ = woken.try_recv();
+                if let Err(error) = settle() {
+                    // Its objects stay pending, which is the safe reading: they
+                    // are dropped after a reboot, or adopted by the next open.
+                    tracing::warn!("Local content store could not settle: {:#}", error);
+                }
+            }
+        })
+        .ok()
+        .map(|_| wake)
+    });
+
+    fn settle_soon() {
+        if let Some(wake) = SETTLER.as_ref() {
+            let _ = wake.try_send(());
+        }
+    }
+
+    /// Makes every object this process has admitted durable: files in
+    /// parallel and without the locks, then the store directory once per
+    /// pass, then one synced commit that clears their pending marks.
+    fn settle() -> buck2_error::Result<()> {
+        loop {
+            let mut settled = Vec::new();
+            let mut root = None;
+            while settled.len() < SETTLE_PASS {
+                let batch = with_store(Vec::new(), |store| {
+                    root.get_or_insert_with(|| store.root.clone());
+                    store.settle_open(SETTLE_FILES)
+                })?;
+                if batch.is_empty() {
+                    break;
+                }
+                Store::settle_sync(&batch)?;
+                settled.extend(batch.into_iter().map(|object| (object.key, object.serial)));
+            }
+            let Some(root) = root.filter(|_| !settled.is_empty()) else {
+                return Ok(());
+            };
+            // Covers every rename so far, so each synced object's name too.
+            File::open(root)?.sync_all()?;
+            with_store((), |store| store.settle_mark(&settled))?;
+        }
     }
 
     pub(super) fn access(
@@ -1192,7 +1456,7 @@ mod linux {
             let group = store.access_group(
                 std::iter::once((destination, digest, executable)),
                 config,
-                ingest,
+                if ingest { Admission::Verify } else { Admission::Lookup },
             )?;
             Ok((group.found, group.deferred))
         })?;
@@ -1213,6 +1477,22 @@ mod linux {
         files: &[(AbsNormPathBuf, FileMetadata)],
         config: DigestConfig,
     ) -> buck2_error::Result<()> {
+        ingest(files, config, Admission::Verify)
+    }
+
+    /// For private snapshots the caller has just hashed; see `Admission::Hashed`.
+    pub(super) fn ingest_snapshots(
+        files: &[(AbsNormPathBuf, FileMetadata)],
+        config: DigestConfig,
+    ) -> buck2_error::Result<()> {
+        ingest(files, config, Admission::Hashed)
+    }
+
+    fn ingest(
+        files: &[(AbsNormPathBuf, FileMetadata)],
+        config: DigestConfig,
+        admission: Admission,
+    ) -> buck2_error::Result<()> {
         let mut offset = 0;
         while offset < files.len() {
             // Release both locks at metadata-quanta boundaries, including
@@ -1223,7 +1503,7 @@ mod linux {
                         (path.as_path(), metadata.digest.data(), metadata.is_executable)
                     }),
                     config,
-                    true,
+                    admission,
                 )?;
                 Ok((group.consumed, group.deferred))
             })?;
@@ -1373,6 +1653,11 @@ mod linux {
             )?;
             assert_eq!(views.0, views.1);
             assert!(views.0 <= store.max_entries);
+            let stray: u64 = store.db.query_row(
+                "SELECT COUNT(*) FROM pending WHERE key NOT IN (SELECT key FROM objects)", [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(stray, 0, "pending mark without an object");
             let mut physical = (0u64, 0u64);
             for entry in fs::read_dir(&store.root)? {
                 let entry = entry?;
@@ -1404,7 +1689,7 @@ mod linux {
                     let group = store.access_group(
                         files[offset..].iter().map(|(path, digest, executable)| {
                             (path.as_path(), digest, *executable)
-                        }), config, true,
+                        }), config, Admission::Verify,
                     )?;
                     assert!(group.found);
                     assert!(group.consumed > 0);
@@ -1473,6 +1758,278 @@ mod linux {
             assert!(hinted(&view)?);
             assert_bounded_and_accounted(&store)?;
             Ok(())
+        }
+
+        #[test]
+        fn reflink_store_admits_hashed_snapshots_by_size_and_hashes_their_views()
+        -> buck2_error::Result<()> {
+            let temp = tempfile::tempdir()?;
+            let config = DigestConfig::leak_new(vec![DigestAlgorithm::Sha256], None)?;
+            let store = Store::open(temp.path().join("store"), 4 * 4096, 4)?;
+            let admit = |path: &Path, digest: &FileDigest, admission: Admission| {
+                store.access_group(std::iter::once((path, digest, false)), config, admission)
+            };
+            // A snapshot whose caller hashed it becomes an object like any other.
+            let bytes = vec![5; 4096];
+            let digest = FileDigest::from_content(&bytes, config.cas_digest_config());
+            let snapshot = temp.path().join("snapshot");
+            fs::write(&snapshot, &bytes)?;
+            assert!(admit(&snapshot, &digest, Admission::Hashed)?.found);
+            let view = temp.path().join("view");
+            assert!(store.access(&view, &digest, false, config, false)?);
+            assert_eq!(fs::read(&view)?, bytes);
+
+            // Its bytes are not hashed again on the way in: a caller that
+            // vouches for other bytes of the same size is believed.
+            let claimed = FileDigest::from_content(&vec![6; 4096], config.cas_digest_config());
+            let wrong = temp.path().join("wrong");
+            fs::write(&wrong, vec![7; 4096])?;
+            assert!(admit(&wrong, &claimed, Admission::Hashed)?.found);
+            let object = store.root.join(Store::key(&claimed));
+            assert!(object.exists());
+            // Nothing is served on that word. The first view is hashed, fails,
+            // and takes the object with it; afterwards it is an ordinary miss.
+            let served = temp.path().join("served");
+            assert!(store.access(&served, &claimed, false, config, false).is_err());
+            assert!(!served.exists());
+            assert!(!object.exists());
+            assert!(!store.access(&served, &claimed, false, config, false)?);
+            assert!(!served.exists());
+            assert_eq!(fs::read(&wrong)?, vec![7; 4096]);
+            assert_bounded_and_accounted(&store)?;
+
+            // Ordinary admission of the same file refuses it before keeping anything,
+            // and a vouched-for snapshot of the wrong size is refused as well.
+            assert!(admit(&wrong, &claimed, Admission::Verify).is_err());
+            assert!(!object.exists());
+            let short = FileDigest::from_content(&vec![7; 4095], config.cas_digest_config());
+            assert!(admit(&wrong, &short, Admission::Hashed).is_err());
+            assert!(!store.root.join(Store::key(&short)).exists());
+            for entry in fs::read_dir(&store.root)? {
+                assert!(!entry?.file_name().as_encoded_bytes().starts_with(b".buck2-pending-"));
+            }
+            drop(store);
+            let store = Store::open(temp.path().join("store"), 4 * 4096, 4)?;
+            assert_bounded_and_accounted(&store)?;
+            Ok(())
+        }
+
+        fn pending(store: &Store) -> buck2_error::Result<Vec<String>> {
+            let mut statement = store.db.prepare("SELECT key FROM pending ORDER BY key")?;
+            let keys = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(keys)
+        }
+
+        /// Power loss cannot be staged in a test. What reopening does about it
+        /// can: these marks now read as made before the machine last booted.
+        fn as_if_rebooted(store: &Store) -> buck2_error::Result<()> {
+            store.db.execute("UPDATE pending SET boot='an-earlier-boot'", [])?;
+            Ok(())
+        }
+
+        fn source(directory: &Path, name: &str, byte: u8, config: DigestConfig)
+        -> buck2_error::Result<(PathBuf, FileDigest, String)> {
+            let bytes = vec![byte; 4096];
+            let path = directory.join(name);
+            fs::write(&path, &bytes)?;
+            let digest = FileDigest::from_content(&bytes, config.cas_digest_config());
+            let key = Store::key(&digest);
+            Ok((path, digest, key))
+        }
+
+        #[test]
+        fn reflink_store_publishes_pending_objects_and_settles_them() -> buck2_error::Result<()> {
+            let temp = tempfile::tempdir()?;
+            let config = DigestConfig::leak_new(vec![DigestAlgorithm::Sha256], None)?;
+            let store = Store::open(temp.path().join("store"), 8 * 4096, 8)?;
+            assert_eq!(store.boot, boot_id());
+            assert!(store.boot.is_some(), "these tests need /proc to tell one boot from another");
+            let (a, a_digest, a_key) = source(temp.path(), "a", 1, config)?;
+            let (b, b_digest, b_key) = source(temp.path(), "b", 2, config)?;
+            assert!(store.access(&a, &a_digest, false, config, true)?);
+            assert!(store.access(&b, &b_digest, false, config, true)?);
+            // Published and accounted, and not yet known to be durable.
+            let mut keys = vec![a_key.clone(), b_key.clone()];
+            keys.sort();
+            assert_eq!(pending(&store)?, keys);
+            assert_bounded_and_accounted(&store)?;
+            // A pending object serves verified views like any other, and a
+            // second file with its bytes admits nothing new.
+            let view = temp.path().join("view");
+            assert!(store.access(&view, &a_digest, true, config, false)?);
+            assert_eq!(fs::read(&view)?, vec![1; 4096]);
+            let (again, _, _) = source(temp.path(), "again", 1, config)?;
+            assert!(store.access(&again, &a_digest, false, config, true)?);
+            assert_eq!(pending(&store)?, keys);
+            // One pass settles both; there is then nothing left to do.
+            assert_eq!(store.settle()?, 2);
+            assert!(pending(&store)?.is_empty());
+            assert_eq!(store.settle()?, 0);
+            assert!(store.root.join(&a_key).exists() && store.root.join(&b_key).exists());
+            assert_bounded_and_accounted(&store)?;
+            Ok(())
+        }
+
+        #[test]
+        fn reflink_store_reopen_keeps_this_boots_pending_objects_and_drops_older_ones()
+        -> buck2_error::Result<()> {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("store");
+            let config = DigestConfig::leak_new(vec![DigestAlgorithm::Sha256], None)?;
+            let store = Store::open(root.clone(), 8 * 4096, 8)?;
+            let (settled, settled_digest, settled_key) = source(temp.path(), "settled", 1, config)?;
+            let (kept, kept_digest, kept_key) = source(temp.path(), "kept", 2, config)?;
+            assert!(store.access(&settled, &settled_digest, false, config, true)?);
+            assert_eq!(store.settle()?, 1);
+            assert!(store.access(&kept, &kept_digest, false, config, true)?);
+            // The daemon dies with an object unsettled; the machine stays up.
+            drop(store);
+            let store = Store::open(root.clone(), 8 * 4096, 8)?;
+            assert!(root.join(&kept_key).exists());
+            assert_eq!(pending(&store)?, vec![kept_key.clone()]);
+            assert_bounded_and_accounted(&store)?;
+            // Whoever opens the store next settles what the dead one left.
+            assert_eq!(store.settle()?, 1);
+            assert!(pending(&store)?.is_empty());
+
+            // Now the machine goes down with an object unsettled, a staging
+            // slot in use and a name the index never heard of.
+            let (lost, lost_digest, lost_key) = source(temp.path(), "lost", 3, config)?;
+            assert!(store.access(&lost, &lost_digest, false, config, true)?);
+            as_if_rebooted(&store)?;
+            fs::write(&store.staging[0], b"interrupted stage")?;
+            fs::write(root.join("unaccounted"), b"renamed, never committed")?;
+            drop(store);
+            let store = Store::open(root.clone(), 8 * 4096, 8)?;
+            // Only what was settled survives. Nothing pending is left behind.
+            assert!(!root.join(&lost_key).exists());
+            assert!(root.join(&settled_key).exists() && root.join(&kept_key).exists());
+            assert!(!store.staging[0].exists() && !root.join("unaccounted").exists());
+            assert!(pending(&store)?.is_empty());
+            assert_eq!(store.settle()?, 0);
+            assert_bounded_and_accounted(&store)?;
+            let entries: u64 = store.db.query_row("SELECT entries FROM totals", [], |row| row.get(0))?;
+            assert_eq!(entries, 2);
+            // The worktree file it was cloned from is untouched, and is not
+            // trusted either: as a weak hint it is hashed before it is used.
+            // Intact, it brings the object back, pending again; changed, the
+            // lookup is a miss.
+            let recovered = temp.path().join("recovered");
+            assert!(store.access(&recovered, &lost_digest, false, config, false)?);
+            assert_eq!(fs::read(&recovered)?, vec![3; 4096]);
+            assert_eq!(pending(&store)?, vec![lost_key.clone()]);
+            as_if_rebooted(&store)?;
+            fs::write(&lost, vec![9; 4096])?;
+            fs::write(&recovered, vec![9; 4096])?;
+            drop(store);
+            let store = Store::open(root.clone(), 8 * 4096, 8)?;
+            assert!(!root.join(&lost_key).exists());
+            let missed = temp.path().join("missed");
+            assert!(!store.access(&missed, &lost_digest, false, config, false)?);
+            assert!(!missed.exists());
+            assert_bounded_and_accounted(&store)?;
+            Ok(())
+        }
+
+        #[test]
+        fn reflink_store_settles_only_the_admission_it_synced() -> buck2_error::Result<()> {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("store");
+            let config = DigestConfig::leak_new(vec![DigestAlgorithm::Sha256], None)?;
+            let store = Store::open(root.clone(), 8 * 4096, 8)?;
+            let (a, a_digest, a_key) = source(temp.path(), "a", 1, config)?;
+            assert!(store.access(&a, &a_digest, false, config, true)?);
+            // A pass has opened the object and is syncing it, without the locks...
+            let batch = store.settle_open(SETTLE_FILES)?;
+            assert_eq!(batch.len(), 1);
+            let first = (batch[0].key.clone(), batch[0].serial);
+            // ...while the store evicts it and admits the same bytes again.
+            store.evict(store.max_bytes, store.max_entries)?;
+            assert!(!root.join(&a_key).exists());
+            assert!(pending(&store)?.is_empty());
+            assert!(store.access(&a, &a_digest, false, config, true)?);
+            assert_eq!(pending(&store)?, vec![a_key.clone()]);
+            // The pass synced a file that no longer has a name. Its mark must
+            // not vouch for the one that took the name since.
+            Store::settle_sync(&batch)?;
+            File::open(&root)?.sync_all()?;
+            store.settle_mark(&[first])?;
+            assert_eq!(pending(&store)?, vec![a_key.clone()]);
+            // Nor does having been settled once outlive an eviction: after a
+            // reboot the second admission is dropped like any pending object.
+            as_if_rebooted(&store)?;
+            drop(store);
+            let store = Store::open(root.clone(), 8 * 4096, 8)?;
+            assert!(!root.join(&a_key).exists());
+            assert_bounded_and_accounted(&store)?;
+
+            // An object that disappears before its pass, here by hand, as a
+            // failed rename or an older engine's eviction would leave it.
+            let (b, b_digest, b_key) = source(temp.path(), "b", 2, config)?;
+            assert!(store.access(&b, &b_digest, false, config, true)?);
+            fs::remove_file(root.join(&b_key))?;
+            assert_eq!(store.settle()?, 1);
+            assert!(pending(&store)?.is_empty());
+            // Its row is an accounted miss, which the next lookup clears.
+            fs::write(&b, vec![7; 4096])?;
+            let output = temp.path().join("output");
+            assert!(!store.access(&output, &b_digest, false, config, false)?);
+            assert_bounded_and_accounted(&store)?;
+
+            // Two live processes: each settles what it admitted, and one that
+            // opens later adopts what it finds. Whoever is second has nothing
+            // left to mark.
+            let (c, c_digest, c_key) = source(temp.path(), "c", 3, config)?;
+            assert!(store.access(&c, &c_digest, false, config, true)?);
+            let peer = Store::open(root.clone(), 8 * 4096, 8)?;
+            assert_eq!(pending(&peer)?, vec![c_key.clone()]);
+            assert_eq!(peer.settle()?, 1);
+            assert!(pending(&store)?.is_empty());
+            assert_eq!(store.settle()?, 0);
+            assert!(root.join(&c_key).exists());
+            assert_bounded_and_accounted(&store)?;
+            Ok(())
+        }
+
+        #[test]
+        fn reflink_store_settler_makes_admitted_objects_durable_unasked() -> buck2_error::Result<()> {
+            super::super::download_tests::check_descriptor_limit(
+                true,
+                "materializers::local_content_store::linux::tests::reflink_store_settler_makes_admitted_objects_durable_unasked",
+                || {
+                    // This callback runs in a child whose process-wide store
+                    // is a fresh directory, under a 64-descriptor limit.
+                    let temp = tempfile::tempdir()?;
+                    let config = DigestConfig::leak_new(vec![DigestAlgorithm::Sha256], None)?;
+                    let mut files = Vec::new();
+                    for index in 0..40u8 {
+                        let bytes = vec![index; 4096];
+                        let path = AbsNormPathBuf::new(temp.path().join(format!("output-{index}")))?;
+                        fs::write(path.as_path(), &bytes)?;
+                        files.push((path, FileMetadata {
+                            digest: buck2_common::file_ops::metadata::TrackedFileDigest::from_content(
+                                &bytes, config.cas_digest_config(),
+                            ),
+                            is_executable: false,
+                        }));
+                    }
+                    ingest_files(&files, config)?;
+                    let root = PathBuf::from(std::env::var_os("BUCK2_LOCAL_CONTENT_STORE").expect("child store"));
+                    let index = Connection::open(root.join("index.sqlite"))?;
+                    let count = |table: &str| -> buck2_error::Result<u64> {
+                        Ok(index.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?)
+                    };
+                    assert_eq!(count("objects")?, 40);
+                    // Nobody asks the settler to run. Admission alone wakes it.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                    while count("pending")? != 0 {
+                        assert!(std::time::Instant::now() < deadline, "objects were never settled");
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    assert_eq!(count("objects")?, 40);
+                    Ok(())
+                },
+            )
         }
 
         #[test]
@@ -1601,7 +2158,7 @@ mod linux {
             let entry_limited = Store::open(temp.path().join("entry-limited"), 7 * 4096, 1)?;
             let first = entry_limited.access_group(
                 files.iter().map(|(path, digest, executable)| (path.as_path(), digest, *executable)),
-                config, true,
+                config, Admission::Verify,
             )?;
             assert_eq!(first.consumed, 1);
             ingest_groups(&entry_limited, &files[1..], config)?;
@@ -1613,7 +2170,7 @@ mod linux {
             let bad_digest = FileDigest::from_content(&vec![91; 4096], config.cas_digest_config());
             assert!(store.access_group(
                 [(good.as_path(), &good_digest, false), (bad.as_path(), &bad_digest, false)].into_iter(),
-                config, true,
+                config, Admission::Verify,
             ).is_err());
             assert!(!root.join(Store::key(&good_digest)).exists());
             assert!(!root.join(Store::key(&bad_digest)).exists());
@@ -1653,7 +2210,7 @@ mod linux {
             // Views of the existing object publish after the locks are released.
             let group = store.access_group(
                 [(good.as_path(), &digest, false), (bad.as_path(), &digest, true)].into_iter(),
-                config, true,
+                config, Admission::Verify,
             )?;
             let failure = Store::publish_deferred(&group.deferred, config)
                 .err().expect("publishing over a directory fails");
@@ -1687,7 +2244,7 @@ mod linux {
             let store = Store::open(temp.path().join("store"), size + 4096, 4)?;
             let group = store.access_group(
                 [(large.as_path(), &digest, false), (small.as_path(), &small_digest, false)].into_iter(),
-                config, true,
+                config, Admission::Verify,
             )?;
             assert_eq!(group.consumed, 1);
             assert!(group.found);
@@ -1853,6 +2410,9 @@ mod linux {
                     for (index, (path, _, _)) in files.iter().enumerate() {
                         assert_eq!(fs::read(path)?, vec![(index % 16) as u8; 4096]);
                     }
+                    // Settling holds its own few descriptors beside staging's.
+                    store.settle()?;
+                    assert!(pending(&store)?.is_empty());
                     Ok(())
                 },
             )
@@ -2278,6 +2838,17 @@ pub(crate) fn ingest_files(
         file(path, metadata.digest.data(), metadata.is_executable, config, true)?;
     }
     Ok(())
+}
+
+/// Admits private snapshots that the caller has itself just hashed and that
+/// nothing else writes. The store checks their size and does not hash them a
+/// second time; it hashes every view it later publishes from them.
+#[cfg(target_os = "linux")]
+pub(crate) fn ingest_snapshots(
+    files: &[(AbsNormPathBuf, FileMetadata)],
+    config: DigestConfig,
+) -> buck2_error::Result<()> {
+    linux::ingest_snapshots(files, config)
 }
 
 /// A remote download is staged beside its destination. Failed downloads and
