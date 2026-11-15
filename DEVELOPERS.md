@@ -160,6 +160,14 @@ that. `cargo_build` is the complete compilation, whose library is what gets
 linked. Which units are libraries in this sense is Cargo's own rule, written
 down in `_library` in `units.bzl`.
 
+A library with a procedural macro anywhere in its compiler dependencies keeps
+one compilation, even with `--pipelining on`. Macros may generate different
+code on each invocation, as `const-random` does; repeating their expansion
+can produce metadata that does not match the objects. This guard includes
+libraries that could re-export a macro, because Cargo's graph does not say
+which ones do. It stops at build-script execution: a macro used only to
+compile `build.rs` does not disqualify the package's library.
+
 Selecting a library still builds the objects of all its dependencies. These
 are required outputs of the selected target, rather than inputs of its
 compiler action: analysis can start early, but a build cannot report success
@@ -177,7 +185,7 @@ reads, so a library with library dependencies has a different identity under
 each choice, and machines that choose differently share cached results only
 for the rest.
 
-Two things keep the pair of actions sound. They ask rustc for the same kinds
+For eligible libraries the two actions ask rustc for the same kinds
 of output (`--emit=dep-info,metadata,link`), because the kinds are part of the
 crate hash that dependents record: a library compiled against metadata from
 one set of kinds does not link objects from another (E0460). And the metadata
@@ -185,7 +193,10 @@ one set of kinds does not link objects from another (E0460). And the metadata
 beside its library, which `qualify.py` checks on the fixture. A compiler that
 broke either would fail there, or at the first link, not silently.
 
-Measured on 2026-11-15 on a 64-core, 128-thread machine that another job
+The following measurements predate the procedural-macro guard and the
+requirement to finish dependency objects for library-only targets; they have
+not been repeated with those fixes. Measured on 2026-11-15 on a 64-core,
+128-thread machine that another job
 kept at a load of 7 to 35, building the 709 units of a 33-program workspace
 in the dev profile, each figure a clean build in seconds:
 

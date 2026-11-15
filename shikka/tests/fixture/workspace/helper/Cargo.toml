@@ -7,6 +7,7 @@ answer = []
 [dependencies]
 outside = { path = "../../outside" }
 leaf = { path = "../leaf" }
+macro-user = { path = "../macro-user" }
 # build.rs reads the workspace's lockfile and a local dependency's source.
 [package.metadata.shikka]
 build-script-reads-workspace = true

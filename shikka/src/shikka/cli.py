@@ -195,7 +195,7 @@ def available_cpus():
 
 
 def pipelined(choice, cpus):
-    """Whether each library gets an action that produces its metadata alone.
+    """Whether eligible libraries get an action that produces metadata alone.
 
     Libraries above it then start when that is written, not when its code is
     generated, which shortens every chain of libraries. The price is each
@@ -346,7 +346,7 @@ def parser():
     p.add_argument("--config-file")
     p.add_argument("--no-local-cas", action="store_true", help="Use cache transport without filesystem sharing")
     p.add_argument("--local-content-store", help="auto (default), off, or a directory")
-    p.add_argument("--pipelining", choices=["auto", "on", "off"], help=f"compile each library's metadata in an action of its own, so the libraries above it start sooner; auto (default) is on where there are {PIPELINING_CPUS} CPUs or more; init records the choice")
+    p.add_argument("--pipelining", choices=["auto", "on", "off"], help=f"compile eligible libraries' metadata in an action of its own, so the libraries above them start sooner; auto (default) is on where there are {PIPELINING_CPUS} CPUs or more; init records the choice")
     p.add_argument("--all-units", action="store_true")
     p.add_argument("--buck-arg", action="append", default=[])
     p.add_argument("command", choices=["init", "generate", "check", "build", "test", "run", "outputs", "targets", "cache"])

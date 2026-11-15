@@ -1,9 +1,9 @@
 """One Buck action per Cargo unit; Cargo resolves, Buck schedules and caches.
 
-With `[shikka] pipelining = true` a library has a second action, which
-produces its metadata alone. Libraries that depend on it compile against that
-and start when it is written, not when the library is complete, as under
-Cargo. Only what links reads a library's objects.
+With `[shikka] pipelining = true` an eligible library has a second action,
+which produces its metadata alone. Libraries that depend on it compile against
+that and start when it is written, not when the library is complete, as under
+Cargo. Libraries that may invoke procedural macros keep one compilation.
 """
 
 CargoUnitInfo = provider(fields = {
@@ -12,6 +12,9 @@ CargoUnitInfo = provider(fields = {
     # pipelined library, the output of anything else.
     "interface": provider_field(Artifact),
     "pipelined": provider_field(bool),
+    # A procedural macro is reachable through compiler dependencies, possibly
+    # re-exported by a library. Build-script execution is a separate boundary.
+    "proc_macros": provider_field(bool),
     # Every unit below this one, by label. A unit that links needs their
     # outputs; a library needs only their interfaces.
     "objects": provider_field(dict),
@@ -103,12 +106,14 @@ def _run(ctx, spec, manifest, closure, incremental, category, prefix, outputs):
 def _unit_impl(ctx):
     spec = json.decode(ctx.attrs.spec)
     library = _library(spec)
-    pipelined = library and read_root_config("shikka", "pipelining", "false") == "true"
+    proc_macros = "proc-macro" in spec["target"]["crate_types"]
     objects = {}
     interfaces = {}
     dependencies = []
     for dep in ctx.attrs.deps:
         info = dep[CargoUnitInfo]
+        if info.spec["mode"] != "run-custom-build":
+            proc_macros = proc_macros or info.proc_macros
         label = str(dep.label.raw_target())
         objects.update(info.objects)
         objects[label] = info.output
@@ -118,6 +123,11 @@ def _unit_impl(ctx):
         if library and info.pipelined:
             dependency["metadata"] = True
         dependencies.append(dependency)
+    # Expanding a proc macro twice may produce different metadata (for example
+    # const-random). Cargo's graph cannot say whether a library re-exports a
+    # macro, so include transitive compiler dependencies in this guard. A macro
+    # used only to compile a build script cannot reach the library this way.
+    pipelined = library and not proc_macros and read_root_config("shikka", "pipelining", "false") == "true"
     closure = interfaces if library else objects
     incremental = spec["mode"] != "run-custom-build" and spec["profile"]["incremental"]
     output = ctx.actions.declare_output("unit", dir = True, has_content_based_path = not incremental)
@@ -152,6 +162,7 @@ def _unit_impl(ctx):
             output = output,
             interface = interface,
             pipelined = pipelined,
+            proc_macros = proc_macros,
             objects = objects,
             # Through a unit that linked, a library above it sees the objects
             # that unit needed: more than it reads, and all already built.

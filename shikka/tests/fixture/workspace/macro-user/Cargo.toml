@@ -1,0 +1,6 @@
+[package]
+name = "macro-user"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+macro-source = { path = "../macro-source" }

@@ -16,7 +16,7 @@ build contract; it does not certify full Cargo compatibility.
 | DISC-008 | The graph is `cargo build --workspace` | Every member is a package Cargo was asked to build, so a member's dylib is not given `-C prefer-dynamic`, as it would be when built only as a dependency by `cargo build -p`. One that others link asks for it in `rustflags` |
 | DISC-009 | A build script's inputs are its package, plus what its manifest declares | `build-script-reads-workspace` adds the workspace manifest, lockfile and local dependency sources. Other files outside the package are not there. On Linux a manifest directory compiled into a build script (`env!`) is `.`: right where the script runs, but not absolute |
 | DISC-010 | A build script's jobserver is its own | Cargo shares one jobserver among every compiler and build script; here each script gets `NUM_JOBS` and a jobserver of that many jobs for itself, and rustc gets none. Several scripts compiling C at once can together use more threads than `-j` |
-| DISC-011 | Pipelining runs a library's analysis twice | A Buck2 action cannot publish its metadata early as one rustc process does under Cargo, so an action of its own writes it. On by default only where there are 64 or more CPUs. A library with errors fails in both actions: one shows them and the other says so |
+| DISC-011 | Pipelining runs eligible libraries' analysis twice | A Buck2 action cannot publish its metadata early as one rustc process does under Cargo, so an action of its own writes it. On by default only where there are 64 or more CPUs. Libraries with direct or transitive procedural-macro compiler dependencies keep one compilation because expansions can differ; macros used only in a build script do not disqualify its library. A pipelined library with errors fails in both actions: one shows them and the other says so |
 
 The fixture is handwritten source, not generated output. `qualify.py` generates
 its reference by running the installed Cargo with the same compiler, compares
@@ -38,6 +38,7 @@ record commands, duration and status. `SHIKKA_TEST_LIGHT=1` uses the reviewed
 | Cargo's `prefer-dynamic` rule; package settings; workspace layout for a build script; Cargo and rustup run in the workspace; a Nix-store tool keeps its name, and rustc its default linker | test_frontend.py | executed | executed |
 | A library below a library: generic and non-inlined calls, with pipelining on and off; with it, metadata identical from both actions | stdout comparison, qualify.py | differential | light fixture |
 | Selecting a library alone still rejects code-generation failures in a dependency, and recovers after the source is restored | qualify.py, invalid inline assembly | differential | light fixture |
+| Non-repeatable procedural macros, used directly and re-exported through a library, keep metadata and objects consistent; build-script-only macro use still permits pipelining | fixture macro emits rustc's process ID; qualify.py compares runtime results and metadata | differential | light fixture |
 | A build script's `NUM_JOBS` and jobserver; rustc's output kinds for a library's two actions; which of the two shows its errors; the pipelining default | test_frontend.py | executed | executed |
 | Service ownership, concurrent startup, mTLS, active-build stop guard, restart | test_service.py | real NativeLink | real NativeLink |
 
