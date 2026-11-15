@@ -259,11 +259,21 @@ class Publication(unittest.TestCase):
         return publisher.check([self.root], [self.upstream.as_uri()], self.destination.as_uri(),
                                key or self.public.read_text().strip())
 
-    def test_published_closure_checks_from_the_caches_alone(self):
+    def test_published_closure_checks(self):
         self.publish()
-        # What the local store says is not consulted beyond the root's name.
-        with patch.object(publisher, 'prepare', side_effect=AssertionError('check staged something')):
-            self.assertEqual(set(self.check()), {self.root, self.middle})
+        self.assertEqual(set(self.check()), {self.root, self.middle})
+
+    def test_check_follows_the_references_the_cache_reports(self):
+        # The local store knows nothing of this reference. Only a walk of the
+        # cache's own metadata finds that it cannot be downloaded.
+        self.publish()
+        absent = '0' * 32 + '-publication-absent'
+        narinfo = self.narinfo(self.destination, self.root)
+        text = narinfo.read_text()
+        self.assertEqual(text.count('\nReferences: '), 1)
+        narinfo.write_text(text.replace('\nReferences: ', f'\nReferences: {absent} '))
+        with self.assertRaisesRegex(ValueError, 'No cache serves:\n/nix/store/' + absent):
+            self.check()
 
     def test_check_names_a_path_no_cache_serves(self):
         self.publish()
