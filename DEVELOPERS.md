@@ -15,6 +15,8 @@ the recorded patches, stays in the repository. The first import is under
 Release publication is inhibited. Upstream workflows are kept
 as reference in `.github/upstream-workflows`, outside GitHub's workflow discovery
 path; repository Actions are also disabled. Do not enable releases implicitly.
+The Nix binary cache below is the one thing published, and only when someone
+runs its command: no workflow does.
 
 ## Source map
 
@@ -22,6 +24,7 @@ path; repository Actions are also disabled. Do not enable releases implicitly.
 - `shikka/src/shikka`: standalone Python 3.11+ Cargo frontend and managed cache supervisor.
 - `shikka/src/shikka/resources`: bundled Buck rules, compiler and test runners.
 - `nix/engine.nix`, root flake: pinned engine compiler, regression checks, narrow frontend packaging.
+- `nix/cache`: the Nix binary cache's settings, its publisher and the publisher's tests.
 - `shikka/engine-origin.json`: source Sekka commit, upstream base and hashes of all 21 imported patches.
 - `shikka/tests`: executable compatibility and service regressions; intentionally small contract.
 
@@ -164,6 +167,93 @@ nothing, and `.` is the same in every checkout.
 Btrfs/XFS storage code is imported without behavioral changes. The APFS follow-up
 detaches rustc's hardlinked incremental aliases before capturing publication
 guards; this avoids false concurrent-mutation failures from sibling ctime updates.
+
+## Nix binary cache
+
+`https://shikka-cache.sekka.computer` serves the Nix package, so that
+`nix build .#shikka` downloads the engine instead of compiling and testing it.
+It is the Cloudflare R2 bucket `shikka-cache` behind a custom domain, and its
+paths are signed with `shikka-cache.sekka.computer-1`;
+`nix/cache/settings.nix` names all three. It has nothing to do with NativeLink
+or the cache of build actions described above.
+
+It holds only what cache.nixos.org lacks of the package's runtime closure. On
+x86_64 Linux that is three paths of 119: the engine, the frontend and the
+default toolchain file, 43 MB compressed. The engine's source is the
+repository without `shikka/`, `nix/`, the flake and the top-level documents
+(`nix/engine.nix`), so a commit that touches only those keeps the engine's
+store path and publishes no new engine. Build inputs such as the pinned
+nightly compiler are not published: changing the engine still means building
+it.
+
+The flake's `nixConfig` names the cache and its public key. Nix applies that
+only when this flake is the one being built, asks before accepting it unless
+given `--accept-flake-config`, and takes the substituter only from a user its
+daemon trusts or when the machine's `trusted-substituters` lists it. A flake
+that takes Shikka as an input does not inherit the setting. Such a project
+names the cache in its own configuration:
+
+```
+extra-substituters = https://shikka-cache.sekka.computer
+extra-trusted-public-keys = shikka-cache.sekka.computer-1:Ma5/jNK/TXzXeNjz9UkjYKVU7vW9HyyBEkAa82+vAvk=
+```
+
+It gets the published store paths as long as it leaves Shikka's `nixpkgs` and
+`rust-overlay` inputs alone. Making them follow its own gives another engine,
+which no cache has.
+
+`nix run .#push-cache` publishes, for the system it runs on:
+
+1. It builds `.#shikka` and uploads `nix-cache-info`, without which Nix does
+   not take a bucket for a cache: a new bucket needs no other preparation.
+2. `nix/cache/prepare_cache.py stage` asks cache.nixos.org and the cache
+   itself which paths of the closure they serve, and writes signed archives
+   of the rest. A path already published stays as it is, even if this machine
+   built it differently; one whose archive is missing or truncated is
+   published again.
+3. The archives are uploaded, then their metadata.
+4. `prepare_cache.py check` asks the caches, not the local store, what a
+   machine with an empty store would get. Every path of the closure must be
+   served with an archive of the advertised length, and Nix downloads the
+   published ones to verify their contents and signatures.
+
+Before any of that it compares the signing key with the public key in
+`settings.nix` and stops if they differ, unless `SHIKKA_CACHE_URL` names a
+trial cache.
+
+Run it once on each platform. Only x86_64 Linux has been built and published;
+the macOS packages have not been built at all.
+
+It needs two credentials, neither of which belongs in the repository:
+
+- The signing key,
+  `~/.config/shikka-cache/shikka-cache.sekka.computer-1.sec`
+  (`SHIKKA_CACHE_CONFIG` overrides the directory). Keep a backup: replacing it
+  means a new key name here and in `settings.nix`, and everyone who trusted
+  the old key trusting the new one.
+- An R2 API token with Object Read & Write on `shikka-cache` only, stored as
+  the AWS profile `shikka-cache` (region `auto`):
+
+  ```sh
+  nix run nixpkgs#awscli2 -- configure --profile shikka-cache
+  ```
+
+  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the environment take its
+  place. From the token's value alone, as Cloudflare shows it for its own
+  API, the access key ID is the token's ID and the secret key is the SHA-256
+  of the value in hexadecimal.
+
+`nix build .#checks.x86_64-linux.cache-publication` runs the publisher's
+tests, which make real stores, keys and caches in the build's own directory
+and use no network. To try the whole command, point it at another cache with
+`SHIKKA_CACHE_URL` and `SHIKKA_CACHE_BUCKET` (and `SHIKKA_CACHE_ENDPOINT` and
+`SHIKKA_CACHE_PROFILE` for another account). The two must name the same
+cache, or paths the bucket lacks look published. `rclone serve s3` over a
+directory, read back as a `file://` cache, is enough.
+
+Nothing removes old paths from the bucket. Do not use R2 lifecycle rules for
+that: a path that has not changed keeps its first upload date while still in
+use.
 
 ## Validation
 
