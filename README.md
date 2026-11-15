@@ -18,6 +18,13 @@ shikka test
 shikka --bin my-app run -- --help
 ```
 
+Compiling and testing the engine takes several minutes. On x86-64 Linux, Nix
+can download it from Shikka's binary cache instead: answer yes when it asks
+about the settings this flake adds, or pass `--accept-flake-config`. Nix only
+takes that answer from a user it trusts;
+[DEVELOPERS.md](DEVELOPERS.md#nix-binary-cache) has the cache's address and
+key for other setups.
+
 No NativeLink service is needed for local builds. To enable a private managed
 cache, supply a NativeLink **1.8.3** executable:
 

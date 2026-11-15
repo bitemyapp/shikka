@@ -5,14 +5,23 @@
     url = "github:oxalica/rust-overlay";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  # Shikka's binary cache (DEVELOPERS.md, "Nix binary cache"). Nix reads this
+  # without evaluating the flake, so it repeats nix/cache/settings.nix; the
+  # cache-settings check compares the two.
+  nixConfig = {
+    extra-substituters = [ "https://shikka-cache.sekka.computer" ];
+    extra-trusted-public-keys = [ "shikka-cache.sekka.computer-1:Ma5/jNK/TXzXeNjz9UkjYKVU7vW9HyyBEkAa82+vAvk=" ];
+  };
   outputs = { self, nixpkgs, rust-overlay }:
     let
       # Not x86_64-darwin: the pinned Nixpkgs no longer evaluates for it.
       systems = [ "x86_64-linux" "aarch64-darwin" ];
       forAll = nixpkgs.lib.genAttrs systems;
+      pkgsFor = system: import nixpkgs { inherit system; };
+      cache = import ./nix/cache/settings.nix;
       packagesFor = system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor system;
           buck2 = import ./nix/engine.nix { inherit pkgs; rustOverlay = rust-overlay.overlays.default; };
           tools = pkgs.writeText "shikka-toolchain.json" (builtins.toJSON {
             rustc = "${pkgs.rustc}/bin/rustc";
@@ -57,6 +66,25 @@
       packages = forAll packagesFor;
       apps = forAll (system: {
         default = { type = "app"; program = "${self.packages.${system}.shikka}/bin/shikka"; };
+        # Publishes this system's package to the binary cache, by hand
+        # (DEVELOPERS.md, "Nix binary cache").
+        push-cache =
+          let push = import ./nix/cache/push.nix { pkgs = pkgsFor system; settings = cache; };
+          in { type = "app"; program = "${push}/bin/shikka-push-cache"; meta.description = push.meta.description; };
+      });
+      checks = forAll (system: {
+        cache-settings =
+          let advertised = (import ./flake.nix).nixConfig;
+          in assert nixpkgs.lib.assertMsg
+            (advertised.extra-substituters == [ cache.url ]
+              && advertised.extra-trusted-public-keys == [ cache.publicKey ]
+              && nixpkgs.lib.hasPrefix "${cache.keyName}:" cache.publicKey)
+            "flake.nix's nixConfig and nix/cache/settings.nix name different caches or keys";
+          (pkgsFor system).emptyFile;
+      } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+        # The publisher's tests build derivations in a store of their own,
+        # which Nix can only do on Linux.
+        cache-publication = import ./nix/cache/tests.nix { pkgs = pkgsFor system; };
       });
     };
 }
