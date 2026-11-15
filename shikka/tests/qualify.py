@@ -29,6 +29,13 @@ with tempfile.TemporaryDirectory(prefix="shikka-qualification-") as directory:
         if (result.returncode == 0) != success or (message and message not in result.stderr):
             raise RuntimeError(result.stdout + result.stderr)
         return result.stdout
+    def library_metadata():
+        """Each pipelined library's metadata, as its metadata action left it and as its compilation did."""
+        found = {"metadata": {}, "unit": {}}
+        for path in (project / "buck-out/shikka").rglob("*.rmeta"):
+            if path.parent.name in found:
+                found[path.parent.name].setdefault(path.name, set()).add(path.read_bytes())
+        return found["metadata"], found["unit"]
     cargo = os.environ.get("SHIKKA_DEFAULT_CARGO", "cargo")
     run([cargo, "generate-lockfile", "--offline"])
     light = bool(os.environ.get("SHIKKA_TEST_LIGHT"))
@@ -53,6 +60,48 @@ with tempfile.TemporaryDirectory(prefix="shikka-qualification-") as directory:
         assert run(build + ["--bin", "shikka-fixture", "run"], cwd=elsewhere, env=probe) == probed
         run(build + ["test"])
         run(app + ["check"])
+        # With pipelining, libraries above a library compile against metadata
+        # that an action of its own writes, without generating code. The
+        # library's compilation writes the same file beside its objects, and
+        # the two must be the same bytes, or what was compiled against one
+        # could not link the other. The default depends on the machine, so
+        # ask for both; without pipelining there is no such file to compare.
+        for choice in ["off", "on"]:
+            assert run(build + ["--pipelining", choice, "--bin", "shikka-fixture", "run"]) == reference
+            run(build + ["--pipelining", choice, "test"])
+        early, complete = library_metadata()
+        assert early and all(len(copies) == 1 and complete.get(name) == copies for name, copies in early.items()), sorted(early)
+        # Selecting only a library must still finish its dependencies' code
+        # generation. An invalid instruction reaches the assembler only during
+        # code generation, so metadata alone succeeds. Both supported native
+        # architectures (x86_64 and aarch64) accept Rust's inline asm syntax.
+        leaf = root / "leaf/src/lib.rs"
+        original = leaf.read_text()
+        leaf.write_text(original + '''
+pub fn codegen_failure() { unsafe { std::arch::asm!("shikka_invalid_instruction"); } }
+''')
+        try:
+            if not light:
+                run([cargo, "build", "--offline", "-p", "helper"], success=False, message="shikka_invalid_instruction")
+            for choice in ["on", "off"]:
+                run(build + ["--pipelining", choice, "-p", "helper", "build"], success=False, message="shikka_invalid_instruction")
+        finally:
+            leaf.write_text(original)
+        run(build + ["--pipelining", "on", "-p", "helper", "build"])
+        # init recorded the choice; a command's own option overrides it for that command.
+        settings = project / ".shikka/project.json"
+        recorded = settings.read_text()
+        assert json.loads(recorded)["pipelining"] == "auto"
+        chosen = lambda: "pipelining = true" in (project / ".shikka/client.buckconfig").read_text()
+        for choice in ["on", "off"]:
+            settings.write_text(json.dumps(dict(json.loads(recorded), pipelining=choice)))
+            run(app + ["--offline", "generate"])
+            run(build + ["build"])
+            assert chosen() == (choice == "on")
+            run(build + ["--pipelining", "off" if choice == "on" else "on", "build"])
+            assert chosen() == (choice == "off")
+        settings.write_text(recorded)
+        run(app + ["--offline", "generate"])
         # An option its command does not read is an error, not a silent no-op.
         run(app + ["--features", "unused", "build"], success=False, message="recorded by shikka init")
         run(app + ["--profile", "release", "test"], success=False, message="always uses Cargo's test profile")

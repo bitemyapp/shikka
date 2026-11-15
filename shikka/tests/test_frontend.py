@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -50,6 +51,18 @@ class Options(unittest.TestCase):
                 self.assertNotIn("--num-threads", cli.buck_command(config, self.parse("build"), targets, "private", []))
         command = cli.buck_command(config, self.parse("-j", "3", "build"), targets, "private", [])
         self.assertEqual(command[command.index("--num-threads") + 1], "3")
+
+    def test_pipelining_follows_the_machine_unless_told(self):
+        self.assertTrue(cli.pipelined("on", 1))
+        self.assertFalse(cli.pipelined("off", 256))
+        self.assertFalse(cli.pipelined("auto", cli.PIPELINING_CPUS - 1))
+        self.assertTrue(cli.pipelined("auto", cli.PIPELINING_CPUS))
+        self.assertGreaterEqual(cli.available_cpus(), 1)
+        # For one command, or to init as the project's choice.
+        self.parse("--pipelining", "on", "test")
+        self.parse("--pipelining", "off", "init")
+        with self.assertRaises(ValueError):
+            self.parse("--pipelining", "on", "generate")
 
     def test_test_runner_is_told_where_the_caller_environment_is(self):
         config, targets = {"buck2": "/engine"}, [{"label": "//:unit"}]
@@ -246,6 +259,139 @@ class Graph(unittest.TestCase):
         generate.require_inside(meta, Path("/project"))
         with self.assertRaisesRegex(ValueError, r"outside \(/project/outside\)\n.*--root /project\.$"):
             generate.require_inside(meta, Path("/project/workspace"))
+
+
+class Libraries(unittest.TestCase):
+    """With pipelining a library has two actions: one for its metadata, one for its objects."""
+
+    def units(self):
+        top, top_targets = cargo_package("top", "/project/top")
+        base, base_targets = cargo_package("base", "/project/base")
+        for package in [top, base]:
+            package["authors"] = []  # As `cargo metadata` always gives it.
+        meta = {"packages": [top, base], "workspace_root": "/project"}
+        def unit(package, target, dependencies=()):
+            return {"pkg_id": package["id"], "target": target, "profile": dict(PROFILE, incremental=False), "platform": None, "mode": "build", "features": [],
+                    "dependencies": [{"index": index, "extern_crate_name": "base"} for index in dependencies]}
+        graph = {"units": [unit(top, top_targets["lib"], [1]), unit(base, base_targets["lib"])], "roots": [0]}
+        prepared, _ = generate.units_from_graph(graph, generate.package_records(meta, Path("/project")), meta)
+        return prepared
+
+    def compile(self, directory, pipelined=None, dependency=None):
+        """compile_unit with a stand-in rustc: its arguments, how it was run, and what was left."""
+        top, base = self.units()
+        output = directory / "out"
+        output.mkdir()
+        payload = {"unit": top, "source": str(directory / "source"), "closure": [str(directory / "base")],
+                   "dependencies": [dict({"directory": str(directory / "base"), "spec": base}, **(dependency or {}))]}
+        def rustc(arguments, **_):
+            # What rustc leaves for --emit=dep-info,metadata,link, with or without code generation.
+            for name in [top["filename"], action.metadata_name(top), "rustc.d"]:
+                (output / name).write_text(name)
+            return subprocess.CompletedProcess(arguments, 0, stderr=b"")
+        with mock.patch.object(action.subprocess, "run", side_effect=rustc) as run:
+            action.compile_unit(payload, output, {}, {"rustc": "rustc", "cc": "cc"}, directory, None, None, pipelined)
+        return run.call_args.args[0], run.call_args.kwargs, sorted(path.name for path in output.iterdir()), top, base
+
+    def test_both_actions_ask_rustc_for_the_same_outputs(self):
+        def kinds(arguments):
+            emit = next(argument for argument in arguments if argument.startswith("--emit="))
+            return sorted(kind.split("=")[0] for kind in emit.removeprefix("--emit=").split(","))
+        with tempfile.TemporaryDirectory() as directory:
+            objects, _, left, top, _ = self.compile(Path(directory).resolve(), "objects")
+            # The library, and the metadata rustc wrote with it; its dependency list is not an output.
+            self.assertEqual(left, sorted([top["filename"], action.metadata_name(top)]))
+        with tempfile.TemporaryDirectory() as directory:
+            metadata, _, left, top, _ = self.compile(Path(directory).resolve(), "metadata")
+            # Only the metadata: the archive -Z no-codegen writes holds no objects.
+            self.assertEqual(left, [action.metadata_name(top)])
+        # The kinds are part of the crate hash: they must not differ between the two.
+        self.assertEqual(kinds(objects), ["dep-info", "link", "metadata"])
+        self.assertEqual(kinds(metadata), kinds(objects))
+        self.assertNotIn("no-codegen", objects)
+        self.assertEqual(metadata[metadata.index("no-codegen") - 1], "-Z")
+
+    def test_a_library_reads_metadata_where_the_rule_says(self):
+        for dependency, suffix in [({"metadata": True}, ".rmeta"), ({}, ".rlib")]:
+            with tempfile.TemporaryDirectory() as directory:
+                arguments, _, _, _, base = self.compile(Path(directory).resolve(), "objects", dependency)
+                extern = arguments[arguments.index("--extern") + 1]
+                self.assertTrue(extern.startswith("base=") and extern.endswith("/base/" + base["filename"].removesuffix(".rlib") + suffix), extern)
+
+    def test_without_pipelining_a_library_is_compiled_as_before(self):
+        with tempfile.TemporaryDirectory() as directory:
+            arguments, how, left, top, _ = self.compile(Path(directory).resolve())
+            self.assertIn("--emit=link", arguments)
+            self.assertNotIn("no-codegen", arguments)
+            self.assertIn(top["filename"], left)
+            # Its errors go straight to stderr: there is no second action to defer to.
+            self.assertIsNone(how["stderr"])
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.compile(Path(directory).resolve(), "objects")[1]["stderr"], subprocess.PIPE)
+
+    def test_a_librarys_errors_are_shown_by_one_of_its_two_actions(self):
+        top, _ = self.units()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(action.sys, "stderr") as stderr:
+            scratch = os.path.join("buck-out", "shikka", "tmp", "root", "0", "cargo_build", "top")
+            shown = lambda: b"".join(call.args[0] for call in stderr.buffer.write.call_args_list)
+            pointed = lambda: [call.args[0] for call in stderr.write.call_args_list if "other failed action" in call.args[0]]
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                with mock.patch.dict(os.environ, {"BUCK_BUILD_ID": "build-1", "BUCK_SCRATCH_PATH": scratch}):
+                    action.CompileFailed(top, 1, b"error: first\n").report()
+                    self.assertEqual((shown(), pointed()), (b"error: first\n", []))
+                    # The same library failing again in the same build: the other action.
+                    action.CompileFailed(top, 1, b"error: second\n").report()
+                    self.assertEqual((shown(), len(pointed())), (b"error: first\n", 1))
+                # A later build starts over, as does an action Buck2 did not name a build to.
+                with mock.patch.dict(os.environ, {"BUCK_BUILD_ID": "build-2", "BUCK_SCRATCH_PATH": scratch}):
+                    action.CompileFailed(top, 1, b"error: third\n").report()
+                with mock.patch.dict(os.environ, {"BUCK_SCRATCH_PATH": scratch}):
+                    os.environ.pop("BUCK_BUILD_ID", None)
+                    action.CompileFailed(top, 1, b"error: fourth\n").report()
+                    action.CompileFailed(top, 1, b"error: fifth\n").report()
+                self.assertEqual((shown(), len(pointed())), (b"error: first\nerror: third\nerror: fourth\nerror: fifth\n", 1))
+            finally:
+                os.chdir(previous)
+        # A signal is a failure too, and a unit with one action wrote its own errors.
+        self.assertEqual(action.CompileFailed(top, -9, None).status, 1)
+        action.CompileFailed(top, 101, None).report()
+
+    def test_a_failed_compilation_raises_with_rustcs_status(self):
+        top, base = self.units()
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory).resolve()
+            (directory / "out").mkdir()
+            payload = {"unit": top, "source": str(directory / "source"), "closure": [], "dependencies": [{"directory": str(directory / "base"), "spec": base}]}
+            tools = {"rustc": "rustc", "cc": "cc"}
+            failed = subprocess.CompletedProcess([], 101, stderr=b"error: no\n")
+            with mock.patch.object(action.subprocess, "run", return_value=failed), self.assertRaises(action.CompileFailed) as raised:
+                action.compile_unit(payload, directory / "out", {}, tools, directory, None, None, "metadata")
+            # Held for report(), which decides whether this action shows them.
+            self.assertEqual((raised.exception.status, raised.exception.diagnostics), (101, b"error: no\n"))
+            with mock.patch.object(action.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), self.assertRaises(action.CompileFailed) as raised:
+                action.compile_unit(payload, directory / "out", {}, tools, directory, None, None)
+            self.assertIsNone(raised.exception.diagnostics)
+
+
+class BuildScripts(unittest.TestCase):
+    def test_a_build_script_gets_cargos_job_count_and_a_jobserver(self):
+        script = """
+import os
+read = int(os.environ["CARGO_MAKEFLAGS"].rsplit("--jobserver-auth=", 1)[1].split(",")[0])
+os.set_blocking(read, False)
+try:
+    tokens = len(os.read(read, 4096))
+except BlockingIOError:
+    tokens = 0
+print(os.environ["NUM_JOBS"], tokens, os.environ["KEPT"])
+"""
+        for jobs in [1, 4]:
+            result = action.run_with_jobserver([sys.executable, "-c", script], jobs, {"KEPT": "yes"}, text=True, stdout=subprocess.PIPE)
+            # The script is one job itself; the tokens are the others.
+            self.assertEqual(result.stdout.split(), [str(jobs), str(jobs - 1), "yes"])
+        self.assertGreaterEqual(action.job_count(), 1)
 
 
 class Workspace(unittest.TestCase):

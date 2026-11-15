@@ -1,5 +1,8 @@
 #[cfg(feature = "answer")]
-pub fn answer() -> u32 { 39 + outside::unit() }
+pub fn answer() -> u32 {
+    macro_user::check();
+    39 + leaf::pass(outside::unit()) + leaf::zero()
+}
 #[cfg(not(feature = "answer"))]
 pub fn answer() -> u32 { 0 }
 #[test]

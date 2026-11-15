@@ -1,0 +1,8 @@
+# A library below a library: `helper` compiles against this one's metadata,
+# and only the program links its objects.
+[package]
+name = "leaf"
+version = "0.1.0"
+edition = "2024"
+[build-dependencies]
+fixture-macro = { path = "../macros" }
